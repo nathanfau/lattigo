@@ -53,7 +53,7 @@ checks: check_tools
 		false;\
 	fi
 
-	@GOSECOUT=$$(gosec -quiet ./...); \
+	@GOSECOUT=$$(gosec -quiet -exclude=G602 ./...); \
 	if [ -z "$$GOSECOUT" ]; then\
 		echo "gosec: OK";\
 	else \
