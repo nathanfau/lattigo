@@ -32,62 +32,71 @@ var ParamsCI ckks.Parameters
 var EncBig *ckks.Encoder
 var DecBig *rlwe.Decryptor
 
-// Slot decrypts ct and prints its first slots in the Std context.
-func Slot(label string, ct *rlwe.Ciphertext) {
+// dbgPrefix prints the aligned "label [ctx, logN= ] lv= sc=" prefix shared by DbgPrinters
+// so their labels and outputs line up in the same columns.
+func dbgPrefix(label, ctx string, ct *rlwe.Ciphertext) {
+	fmt.Printf("  %-30s  [%-3s, logN=%-2d, lv=%-2d sc=2^%-6.1f]   ", label, ctx, ct.LogN(), ct.Level(), math.Log2(ct.Scale.Float64()))
+}
+
+// DbgSlotStd decrypts ct and prints its first slots in the Std context.
+func DbgSlotStd(label string, ct *rlwe.Ciphertext) {
 	if DecStd == nil || EncStd == nil {
 		return
 	}
 	n := 2
 	buf := make([]complex128, n)
 	if err := EncStd.Decode(DecStd.DecryptNew(ct), buf); err != nil {
-		fmt.Printf("  %-30s  error: %v\n", label, err)
+		dbgPrefix(label, "Std", ct)
+		fmt.Printf("decode error: %v\n", err)
 		return
 	}
-	fmt.Printf("  %-30s  [Std logN=%d slots=%d]  lv=%-2d  sc=2^%.1f   ", label, ct.LogN(), ct.Slots(), ct.Level(), math.Log2(ct.Scale.Float64()))
+	dbgPrefix(label, "Std", ct)
 	for _, v := range buf[:n] {
 		fmt.Printf("(%+.15f%+.15fi) ", real(v), imag(v))
 	}
 	fmt.Println("...")
 }
 
-// SlotCI is the conjugate-invariant (CI) variant of Slot.
-func SlotCI(label string, ct *rlwe.Ciphertext) {
+// DbgSlotCI is the conjugate-invariant (CI) variant of DbgSlotStd.
+func DbgSlotCI(label string, ct *rlwe.Ciphertext) {
 	if DecCI == nil || EncCI == nil {
 		return
 	}
 	n := 2
 	buf := make([]complex128, n)
 	if err := EncCI.Decode(DecCI.DecryptNew(ct), buf); err != nil {
-		fmt.Printf("  %-30s  error: %v\n", label, err)
+		dbgPrefix(label, "CI", ct)
+		fmt.Printf("decode error: %v\n", err)
 		return
 	}
-	fmt.Printf("  %-30s  [CI  logN=%d slots=%d]  lv=%-2d  sc=2^%.1f   ", label, ct.LogN(), ct.Slots(), ct.Level(), math.Log2(ct.Scale.Float64()))
+	dbgPrefix(label, "CI", ct)
 	for _, v := range buf[:n] {
 		fmt.Printf("(%+.15f%+.15fi) ", real(v), imag(v))
 	}
 	fmt.Println("...")
 }
 
-// SlotBig is the Big-context variant of Slot.
-func SlotBig(label string, ct *rlwe.Ciphertext) {
+// DbgSlotBig is the Big-context variant of DbgSlotStd.
+func DbgSlotBig(label string, ct *rlwe.Ciphertext) {
 	if DecBig == nil || EncBig == nil {
 		return
 	}
 	n := 2
 	buf := make([]complex128, n)
 	if err := EncBig.Decode(DecBig.DecryptNew(ct), buf); err != nil {
-		fmt.Printf("  %-30s  error: %v\n", label, err)
+		dbgPrefix(label, "Big", ct)
+		fmt.Printf("decode error: %v\n", err)
 		return
 	}
-	fmt.Printf("  %-30s  [Std logN=%d slots=%d]  lv=%-2d  sc=2^%.1f   ", label, ct.LogN(), ct.Slots(), ct.Level(), math.Log2(ct.Scale.Float64()))
+	dbgPrefix(label, "Big", ct)
 	for _, v := range buf[:n] {
 		fmt.Printf("(%+.15f%+.15fi) ", real(v), imag(v))
 	}
 	fmt.Println("...")
 }
 
-// Coeff prints the first centered coefficients of a ciphertext's decrypted plaintext.
-func Coeff(label string, ct *rlwe.Ciphertext) {
+// DbgCoeff prints the first coefficients of a ciphertext's decrypted plaintext.
+func DbgCoeff(label string, ct *rlwe.Ciphertext) {
 	if DecStd == nil {
 		return
 	}
@@ -96,7 +105,8 @@ func Coeff(label string, ct *rlwe.Ciphertext) {
 	q0 := ParamsStd.Q()[0]
 	half := q0 >> 1
 	scale := ct.Scale.Float64()
-	fmt.Printf("  %-30s  lv=%-2d  sc=2^%.1f   coeffs: ", label, ct.Level(), math.Log2(scale))
+	dbgPrefix(label, "Cff", ct)
+	fmt.Print("coeffs: ")
 	for i := range n {
 		c := pt.Value.Coeffs[0][i]
 		var v int64
@@ -110,8 +120,9 @@ func Coeff(label string, ct *rlwe.Ciphertext) {
 	fmt.Println("...")
 }
 
-// PrintPrec prints the precision statistics of ct against the wanted values (Std context).
-func PrintPrec(label string, want []float64, ct *rlwe.Ciphertext) {
+// PrintPrecStd prints the precision statistics of ct against the wanted values (Std context).
+// want may be []float64 or []complex128 (anything GetPrecisionStats accepts).
+func PrintPrecStd(label string, want interface{}, ct *rlwe.Ciphertext) {
 	if DecStd == nil || EncStd == nil {
 		return
 	}
@@ -119,8 +130,8 @@ func PrintPrec(label string, want []float64, ct *rlwe.Ciphertext) {
 	fmt.Printf(" %s \n%s", label, prec.String())
 }
 
-// PrintPrecCI is the conjugate-invariant (CI) variant of PrintPrec.
-func PrintPrecCI(label string, want []float64, ct *rlwe.Ciphertext) {
+// PrintPrecCI is the conjugate-invariant (CI) variant of PrintPrecStd.
+func PrintPrecCI(label string, want interface{}, ct *rlwe.Ciphertext) {
 	if DecCI == nil || EncCI == nil {
 		return
 	}
@@ -128,8 +139,8 @@ func PrintPrecCI(label string, want []float64, ct *rlwe.Ciphertext) {
 	fmt.Printf(" %s \n%s", label, prec.String())
 }
 
-// Chain prints the remaining chain of primes of the ct,
-func Chain(label string, eval *ckks.Evaluator, ct *rlwe.Ciphertext) {
+// DbgChain prints the remaining chain of primes of the ct,
+func DbgChain(label string, eval *ckks.Evaluator, ct *rlwe.Ciphertext) {
 	Q := eval.GetRLWEParameters().Q()
 	var sb strings.Builder
 	for i := 0; i <= ct.Level(); i++ {
@@ -138,6 +149,6 @@ func Chain(label string, eval *ckks.Evaluator, ct *rlwe.Ciphertext) {
 		}
 		fmt.Fprintf(&sb, "%d", int(math.Round(math.Log2(float64(Q[i])))))
 	}
-	fmt.Printf("       %-34s lv=%-2d sc=2^%-5.1f [%s]\n",
-		label, ct.Level(), math.Log2(ct.Scale.Float64()), sb.String())
+	dbgPrefix(label, "Chn", ct)
+	fmt.Printf("[%s]\n", sb.String())
 }
