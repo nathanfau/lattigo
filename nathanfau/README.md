@@ -4,18 +4,20 @@
 
 This repository is a fork of Lattigo v6 made on the 4th of july 2026. 
 
-Please note that all my modifications and my implementation are located in the `nathanfau/` directory. The rest of the original Lattigo codebase remains entirely untouched.
+All my modifications and my implementation are located in the `nathanfau/` directory. The rest of the original Lattigo codebase remains entirely untouched.
 
 ## Packages
 
 The `nathanfau/` directory contains the following packages. They are designed to be completely independent of one another:
 
 * `aes`
+* `algo1`
 * `bbbts`
 * `bitbatching`
 * `cleaning`
 * `convctx`
 * `debug`
+* `transciphering`
 * `trigo`
 * `utils`
 
