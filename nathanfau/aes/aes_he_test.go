@@ -10,50 +10,6 @@ import (
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
 
-// encStateRepl encrypts a cleartext state bit-sliced, each bit replicated over all slots.
-func encStateRepl(params ckks.Parameters, ecd *ckks.Encoder, enc *rlwe.Encryptor, state [16]byte, level int) (st StateHE, err error) {
-	slots := params.MaxSlots()
-	for b := 0; b < 16; b++ {
-		for i := 0; i < 8; i++ {
-			bit := float64((state[b] >> uint(i)) & 1)
-			vals := make([]float64, slots)
-			for s := range vals {
-				vals[s] = bit // replicate over all slots
-			}
-			pt := ckks.NewPlaintext(params, level)
-			if err = ecd.Encode(vals, pt); err != nil {
-				return st, fmt.Errorf("encStateRepl byte %d bit %d: %w", b, i, err)
-			}
-			ct := ckks.NewCiphertext(params, 1, level)
-			if err = enc.Encrypt(pt, ct); err != nil {
-				return st, fmt.Errorf("encStateRepl encrypt byte %d bit %d: %w", b, i, err)
-			}
-			st[b][i] = ct
-		}
-	}
-	return st, nil
-}
-
-// decStateBatch decrypts a bit-sliced state into one cleartext state per slot (bit threshold 0.5).
-func decStateBatch(params ckks.Parameters, ecd *ckks.Encoder, dec *rlwe.Decryptor, st StateHE) ([][16]byte, error) {
-	slots := params.MaxSlots()
-	out := make([][16]byte, slots)
-	buf := make([]complex128, slots)
-	for b := 0; b < 16; b++ {
-		for i := 0; i < 8; i++ {
-			if err := ecd.Decode(dec.DecryptNew(st[b][i]), buf); err != nil {
-				return nil, fmt.Errorf("decStateBatch byte %d bit %d: %w", b, i, err)
-			}
-			for s := 0; s < slots; s++ {
-				if real(buf[s]) >= 0.5 { // bit in {0,1}, threshold 0.5
-					out[s][b] |= 1 << uint(i)
-				}
-			}
-		}
-	}
-	return out, nil
-}
-
 // a fixed AES state used by every operation test.
 var testState = [16]byte{
 	0x19, 0x3d, 0xe3, 0xbe, 0xa0, 0xf4, 0xe2, 0x2b,
@@ -62,7 +18,6 @@ var testState = [16]byte{
 
 func newAESContext(t *testing.T) (ckks.Parameters, *ckks.Encoder, *rlwe.Encryptor, *rlwe.Decryptor, *Evaluator) {
 	t.Helper()
-	// LogDefaultScale = prime size so the repeated square/rescale of XOR keeps the scale stable.
 	params, err := ckks.NewParametersFromLiteral(ckks.ParametersLiteral{
 		LogN:            12,
 		LogQ:            []int{55, 45, 45, 45, 45, 45, 45, 45},
@@ -102,7 +57,7 @@ func dbgState(label string, ae *Evaluator, params ckks.Parameters, clear [16]byt
 // checkState compares slot 0 of the decrypted state against the cleartext want.
 func checkState(t *testing.T, params ckks.Parameters, ecd *ckks.Encoder, dec *rlwe.Decryptor, st StateHE, want [16]byte, op string) {
 	t.Helper()
-	got, err := decStateBatch(params, ecd, dec, st)
+	got, err := DecStateBatch(params, ecd, dec, st)
 	if err != nil {
 		t.Fatalf("%s decrypt: %v", op, err)
 	}
@@ -118,11 +73,11 @@ func TestAddRoundKey(t *testing.T) {
 		0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
 	}
 
-	st, err := encStateRepl(params, ecd, enc, testState, params.MaxLevel())
+	st, err := EncStateRepl(params, ecd, enc, testState, params.MaxLevel())
 	if err != nil {
 		t.Fatalf("enc state: %v", err)
 	}
-	rkHE, err := encStateRepl(params, ecd, enc, rk, params.MaxLevel())
+	rkHE, err := EncStateRepl(params, ecd, enc, rk, params.MaxLevel())
 	if err != nil {
 		t.Fatalf("enc rk: %v", err)
 	}
@@ -143,7 +98,7 @@ func TestAddRoundKey(t *testing.T) {
 func TestSubBytesV1(t *testing.T) {
 	params, ecd, enc, dec, ae := newAESContext(t)
 
-	st, err := encStateRepl(params, ecd, enc, testState, params.MaxLevel())
+	st, err := EncStateRepl(params, ecd, enc, testState, params.MaxLevel())
 	if err != nil {
 		t.Fatalf("enc state: %v", err)
 	}
@@ -170,7 +125,7 @@ func TestSubBytesV1(t *testing.T) {
 func TestSubBytesV2(t *testing.T) {
 	params, ecd, enc, dec, ae := newAESContext(t)
 
-	st, err := encStateRepl(params, ecd, enc, testState, params.MaxLevel())
+	st, err := EncStateRepl(params, ecd, enc, testState, params.MaxLevel())
 	if err != nil {
 		t.Fatalf("enc state: %v", err)
 	}
@@ -203,7 +158,7 @@ func TestSubBytesV2(t *testing.T) {
 func TestSubBytesV3(t *testing.T) {
 	params, ecd, enc, dec, ae := newAESContext(t)
 
-	st, err := encStateRepl(params, ecd, enc, testState, params.MaxLevel())
+	st, err := EncStateRepl(params, ecd, enc, testState, params.MaxLevel())
 	if err != nil {
 		t.Fatalf("enc state: %v", err)
 	}
@@ -235,7 +190,7 @@ func TestSubBytesV3(t *testing.T) {
 func TestSubBytesV4(t *testing.T) {
 	params, ecd, enc, dec, ae := newAESContext(t)
 
-	st, err := encStateRepl(params, ecd, enc, testState, params.MaxLevel())
+	st, err := EncStateRepl(params, ecd, enc, testState, params.MaxLevel())
 	if err != nil {
 		t.Fatalf("enc state: %v", err)
 	}
@@ -267,7 +222,7 @@ func TestSubBytesV4(t *testing.T) {
 func TestShiftRows(t *testing.T) {
 	params, ecd, enc, dec, ae := newAESContext(t)
 
-	st, err := encStateRepl(params, ecd, enc, testState, params.MaxLevel())
+	st, err := EncStateRepl(params, ecd, enc, testState, params.MaxLevel())
 	if err != nil {
 		t.Fatalf("enc state: %v", err)
 	}
@@ -285,7 +240,7 @@ func TestShiftRows(t *testing.T) {
 func TestMixColumnsV2(t *testing.T) {
 	params, ecd, enc, dec, ae := newAESContext(t)
 
-	st, err := encStateRepl(params, ecd, enc, testState, params.MaxLevel())
+	st, err := EncStateRepl(params, ecd, enc, testState, params.MaxLevel())
 	if err != nil {
 		t.Fatalf("enc state: %v", err)
 	}
@@ -306,7 +261,7 @@ func TestMixColumnsV2(t *testing.T) {
 func TestMixColumnsV1(t *testing.T) {
 	params, ecd, enc, dec, ae := newAESContext(t)
 
-	st, err := encStateRepl(params, ecd, enc, testState, params.MaxLevel())
+	st, err := EncStateRepl(params, ecd, enc, testState, params.MaxLevel())
 	if err != nil {
 		t.Fatalf("enc state: %v", err)
 	}

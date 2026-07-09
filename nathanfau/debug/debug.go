@@ -32,10 +32,10 @@ var ParamsCI ckks.Parameters
 var EncBig *ckks.Encoder
 var DecBig *rlwe.Decryptor
 
-// dbgPrefix prints the aligned "label [ctx, logN= ] lv= sc=" prefix shared by DbgPrinters
+// dbgPrefix prints the aligned "label [ctx, logN= ,  lv= , sc= ]" prefix shared by DbgPrinters
 // so their labels and outputs line up in the same columns.
 func dbgPrefix(label, ctx string, ct *rlwe.Ciphertext) {
-	fmt.Printf("  %-30s  [%-3s, logN=%-2d, lv=%-2d sc=2^%-6.1f]   ", label, ctx, ct.LogN(), ct.Level(), math.Log2(ct.Scale.Float64()))
+	fmt.Printf("  %-30s  [%-3s, logN=%-2d, lv=%-2d sc=2^%-9.3f]   ", label, ctx, ct.LogN(), ct.Level(), math.Log2(ct.Scale.Float64()))
 }
 
 // DbgSlotStd decrypts ct and prints its first slots in the Std context.

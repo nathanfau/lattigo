@@ -3,6 +3,7 @@ package aes
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
@@ -16,17 +17,33 @@ type ByteHE [8]*rlwe.Ciphertext
 type StateHE [16]ByteHE
 
 // Evaluator runs the bit-sliced AES round functions over CKKS ciphertexts.
+//
+// When noTrick is set, the XOR-based ops (xor, and everything built on it: xorByte, AddRoundKey,
+// xtime, MixColumns) drop the squaring/scale-chain "trick" and use the standard leveled path
+// (DropLevel alignment + MulRelin/Rescale) instead.
 type Evaluator struct {
-	eval *ckks.Evaluator
+	eval    *ckks.Evaluator
+	noTrick bool
 }
 
+// NewEvaluator builds the ~optimized (trick) evaluator
 func NewEvaluator(eval *ckks.Evaluator) *Evaluator {
 	return &Evaluator{eval: eval}
 }
 
-// xor computes x XOR y = (x - y)^2 between bits (ciphertexts in {0,1}). Level alignment and
-// squaring go through utils.AlignBitLevels
+// NewEvaluatorNoTrick builds the ~standard evaluator: the XOR-based ops use the standard
+// leveled path
+func NewEvaluatorNoTrick(eval *ckks.Evaluator) *Evaluator {
+	return &Evaluator{eval: eval, noTrick: true}
+}
+
+// xor computes x XOR y between bits (ciphertexts in {0,1}). In trick mode it is (x - y)^2 with
+// level alignment by squaring (utils.AlignBitLevels + utils.SquareBit)
 func (a *Evaluator) xor(x, y *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+	if a.noTrick {
+		return a.xorStd(x, y)
+	}
+
 	xx := x.CopyNew()
 	yy := y.CopyNew()
 
@@ -38,6 +55,28 @@ func (a *Evaluator) xor(x, y *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
 	}
 	if err := utils.SquareBit(a.eval, xx); err != nil {
 		return nil, fmt.Errorf("xor square: %w", err)
+	}
+	return xx, nil
+}
+
+// xorStd computes x XOR y = (x - y)^2 for bits: the SAME square as the trick xor, but the standard
+// leveled way. Levels are aligned by DropLevel (utils.AlignLevels, no squaring) instead of the
+// trick's AlignBitLevels, and the difference is squared with a plain MulRelin + Rescale instead of
+// utils.SquareBit. Consumes one level, like the trick variant, but the scale is not kept on the
+// canonical chain.
+func (a *Evaluator) xorStd(x, y *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+	xx := x.CopyNew()
+	yy := y.CopyNew()
+
+	utils.AlignLevels(a.eval, xx, yy)
+	if err := a.eval.Sub(xx, yy, xx); err != nil { // x - y
+		return nil, fmt.Errorf("xorStd x-y: %w", err)
+	}
+	if err := a.eval.MulRelin(xx, xx, xx); err != nil { // (x - y)^2
+		return nil, fmt.Errorf("xorStd square: %w", err)
+	}
+	if err := a.eval.Rescale(xx, xx); err != nil {
+		return nil, fmt.Errorf("xorStd rescale: %w", err)
 	}
 	return xx, nil
 }
@@ -183,7 +222,10 @@ func (a *Evaluator) mixColumnsV1(st StateHE) (StateHE, error) {
 			cts = append(cts, out[b][i])
 		}
 	}
-	if err := utils.FlattenBitLevels(a.eval, cts); err != nil {
+	if a.noTrick {
+		// Standard leveled uniformization: DropLevel only, no squaring.
+		utils.FlattenLevels(a.eval, cts)
+	} else if err := utils.FlattenBitLevels(a.eval, cts); err != nil {
 		return out, fmt.Errorf("MixColumns level uniformization: %w", err)
 	}
 
@@ -275,4 +317,52 @@ func (a *Evaluator) MixColumnsV2(st StateHE) (StateHE, error) {
 		}
 	}
 	return out, nil
+}
+
+// SubBytes applies the selected SubByte version (1..4) to all 16 bytes of the state.
+//
+// SubBytes is the one round op whose trick/no-trick behaviour is chosen by the version rather
+// than by the evaluator's noTrick flag: V1 builds the S-box monomials with the squaring product
+// (utils.MulBits) and flattens by squaring (utils.FlattenBitLevels).
+func (a *Evaluator) SubBytes(st StateHE, version int) (StateHE, error) {
+	var out StateHE
+	if a.noTrick && version == 1 {
+		return out, fmt.Errorf("SubBytes: version 1 is the squaring-trick S-box (MulBits + FlattenBitLevels); use -subbytes 2, 3 or 4 in no-trick mode")
+	}
+	var sub func(ByteHE) (ByteHE, error)
+	switch version {
+	case 1:
+		sub = a.SubByteV1
+	case 2:
+		sub = a.SubByteV2
+	case 3:
+		sub = a.SubByteV3
+	case 4:
+		sub = a.SubByteV4
+	default:
+		return out, fmt.Errorf("SubBytes: unknown version %d (want 1..4)", version)
+	}
+	for b := 0; b < 16; b++ {
+		t0 := time.Now()
+		ob, err := sub(st[b])
+		if err != nil {
+			fmt.Println()
+			return out, fmt.Errorf("SubBytes byte %d (v%d): %w", b, version, err)
+		}
+		fmt.Printf(" [SubBytes v%d] byte %2d/16 done (%s)\n", version, b+1, time.Since(t0).Round(time.Millisecond))
+		out[b] = ob
+	}
+	return out, nil
+}
+
+// MixColumns dispatches to the selected MixColumns version
+func (a *Evaluator) MixColumns(st StateHE, version int) (StateHE, error) {
+	switch version {
+	case 1:
+		return a.mixColumnsV1(st)
+	case 2:
+		return a.MixColumnsV2(st)
+	default:
+		return StateHE{}, fmt.Errorf("MixColumns: unknown version %d (want 1..2)", version)
+	}
 }

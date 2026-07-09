@@ -8,6 +8,52 @@ import (
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
 
+// ============================================================================================
+// QUICK REFERENCE
+//
+//   value? = what happens to the DECODED value
+//     Y        preserved EXACTLY - DropLevel only (RNS limb truncation), adds no error
+//     ~Y       preserved ALMOST exactly - a Rescale is involved, so its rounding noise is added
+//     ~Y(bit)  ~Y but ONLY for p in {0,1} (p^2 = p); amplifies error near s=1, wrong otherwise
+//     product  the func's job is to output x*y
+//     combine  the func's job is to output a + i*b
+//
+//   scale? = what happens to the SCALE metadata
+//     chain    stays on the canonical 2^Delta chain -> Add/Sub/Mul with other chain
+//              ciphertexts is exact with NO manual scale matching
+//     chain=   on the chain AND all outputs land on the SAME scale (ready to Add/Sub)
+//     kept     original scale kept, may sit OFF the chain, so YOU must match it
+//              (ForceScale) before combining with a chain ciphertext
+//     Delta^2  degree-2 product scale (~Delta^2), not yet rescaled
+//     set      forced to a scale target
+//
+//   level? = levels consumed by the call.
+//
+// 	 ops = relin + rescale actually performed.
+//
+//   func                  | value?  | scale?  | level?              					| ops (relin+resc)
+//   ----------------------+---------+---------+----------------------------------------+-----------------
+//   ForceScale(ct,s)      | ~Y      | set     | -1  (0 if already scaled at given s)	| 0+1
+//   AlignLevels(a,b)      | Y       | kept    | min(a,b)       						| 0+0
+//   FlattenLevels(cts)    | Y       | kept    | min(all)         						| 0+0
+//   CombineReIm(a,b)      | combine | kept(a) | 0 (a and b are already align)			| 0+0
+//   ----------------------+---------+---------+----------------------------------------+-----------------
+//   SquareBit(ct)         | ~Y(bit) | chain   | -1                  					| 1+1
+//   DescendBit(ct,l)      | ~Y(bit) | chain   | current_level - l = k 					| k*(1+1)
+//   AlignBitLevels(a,b)   | ~Y(bit) | chain=  | min(a,b) = k   	    				| k*(1+1)
+//   FlattenBitLevels(cts) | ~Y(bit) | chain=  | min(all) = k  	    					| k*(1+1)
+//   ----------------------+---------+---------+----------------------------------------+-------------------
+//   MulBits(x,y)          | product | chain   | -1 (+align squares) 					| 1+1 (+k*(1+1))
+//   MulLeveled(a,b)       | product | kept    | -1                  					| 1+1
+//   MulLeveledLazy(a,b)   | product | Delta^2 | 0  (output is deg-2)  					| 0+0
+//
+// Rule of thumb: a bit-sliced boolean circuit (homomorphic AES) uses the "chain" column
+// (SquareBit / ... / MulBits) so every gate keeps scale = f(level) and Add/Sub need no
+// fixups.
+// Use the "kept" column (AlignLevels / MulLeveled / ...) when YOU manage scales
+// yourself (RescaleTo / ForceScale to a fixed target).
+// ============================================================================================
+
 // OpCounter counts the expensive CKKS operations, used when designing differents SubByts versions.
 type OpCounter struct {
 	Relin   int
@@ -35,25 +81,19 @@ func AlignLevels(eval *ckks.Evaluator, a, b *rlwe.Ciphertext) {
 	}
 }
 
-// The functions below descend a ciphertext to a lower level (or align two/many to a common
-// level) by SQUARING, as an alternative to AlignLevels/DropLevel above. The two families
-// solve different problems and are NOT interchangeable:
-//
-//   - AlignLevels (DropLevel) is VALUE-preserving, but keeps the ORIGINAL SCALE.
-//     The dropped ciphertext no longer sits on the "scale reached by successive rescales"
-//     chain, so it can only be combined (Add/Sub) with a ciphertext whose scale has been
-//     matched by hand (see ForceScale), otherwise the scales mismatch.
-//
-//   - SquareBit, ...: descend by squarring (MulRelin + Rescale). This is VALUE-preserving only for
-//     a bit p in {0,1}, but the Rescale keeps the scale on the canonical
-//     chain: the scale at a given level is exactly what repeated squaring produces. Two bit
-//     ciphertexts brought to the same level this way share the SAME SCALE, so Add/Sub/Mul
-//     between them are exact with no ForceScale. This is what lets a bit-sliced boolean
-//     circuit (e.g. the homomorphic AES) keep the invariant scale = f(level) across gates.
-//
-// Rule : Use AlignLevels when you MANAGE SCALES YOURSELF (RescaleTo/ForceScale to a
-// fixed target) and use the squaring variants when your ciphertexts encrypt bits and you want each level
-// drop to also fix up the scale automatically (one operation does both).
+// CombineReIm returns a + i*b (levels aligned by DropLevel).
+func CombineReIm(eval *ckks.Evaluator, a, b *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+	ib := b.CopyNew()
+	if err := eval.Mul(ib, complex(0, 1), ib); err != nil {
+		return nil, fmt.Errorf("CombineReIm mul i: %w", err)
+	}
+	out := a.CopyNew()
+	AlignLevels(eval, out, ib)
+	if err := eval.Add(out, ib, out); err != nil {
+		return nil, fmt.Errorf("CombineReIm add: %w", err)
+	}
+	return out, nil
+}
 
 // SquareBit computes ct <- ct^2 (MulRelin + Rescale), descending one level. For a bit p in
 // {0,1}, p^2 = p, so the value is preserved while the scale follows the prime chain.
