@@ -155,71 +155,67 @@ func Algo1(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.Ciph
 
 // extractExp splits cos and sin into
 //
-//	ctReal = Re(cos) + i*Re(sin)
-//	ctImag = Im(cos) + i*Im(sin)
+//	ctReal = Re(cos) + i*Re(sin) = (C + conj(C) + i(S + conj(S))) / 2
+//	ctImag = Im(cos) + i*Im(sin) = (i(conj(C) - C) - (conj(S) - S)) / 2
 func extractExp(e *ckks.Evaluator, ctCosC, ctSinC *rlwe.Ciphertext) (ctReal, ctImag *rlwe.Ciphertext, err error) {
-	ctCosReal, err := ctRePart(e, ctCosC)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Re cos: %w", err)
+	Cc := ctCosC.CopyNew()
+	if err = e.Conjugate(Cc, Cc); err != nil {
+		return nil, nil, fmt.Errorf("conj cos: %w", err)
 	}
-	ctCosImag, err := ctImPart(e, ctCosC)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Im cos: %w", err)
-	}
-	ctSinReal, err := ctRePart(e, ctSinC)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Re sin: %w", err)
-	}
-	ctSinImag, err := ctImPart(e, ctSinC)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Im sin: %w", err)
+	Sc := ctSinC.CopyNew()
+	if err = e.Conjugate(Sc, Sc); err != nil {
+		return nil, nil, fmt.Errorf("conj sin: %w", err)
 	}
 
-	if ctReal, err = utils.CombineReIm(e, ctCosReal, ctSinReal); err != nil {
-		return nil, nil, fmt.Errorf("combine ct_real: %w", err)
+	// ctReal = (C + conj(C) + i(S + conj(S))) / 2
+	reC := ctCosC.CopyNew()
+	if err = e.Add(reC, Cc, reC); err != nil { // C + conj(C)
+		return nil, nil, fmt.Errorf("real C+conj(C): %w", err)
 	}
-	if ctImag, err = utils.CombineReIm(e, ctCosImag, ctSinImag); err != nil {
-		return nil, nil, fmt.Errorf("combine ct_imag: %w", err)
+	reS := ctSinC.CopyNew()
+	if err = e.Add(reS, Sc, reS); err != nil { // S + conj(S)
+		return nil, nil, fmt.Errorf("real S+conj(S): %w", err)
 	}
+	if err = e.Mul(reS, complex(0, 1), reS); err != nil { // i(S + conj(S))
+		return nil, nil, fmt.Errorf("real *i: %w", err)
+	}
+	utils.AlignLevels(e, reC, reS)
+	if err = e.Add(reC, reS, reC); err != nil {
+		return nil, nil, fmt.Errorf("real sum: %w", err)
+	}
+	if err = e.Mul(reC, complex(0.5, 0), reC); err != nil { // / 2
+		return nil, nil, fmt.Errorf("real *1/2: %w", err)
+	}
+	if err = e.Rescale(reC, reC); err != nil {
+		return nil, nil, fmt.Errorf("real rescale: %w", err)
+	}
+	ctReal = reC
+
+	// ctImag = (i(conj(C) - C) - (conj(S) - S)) / 2
+	imC := Cc.CopyNew()
+	if err = e.Sub(imC, ctCosC, imC); err != nil { // conj(C) - C
+		return nil, nil, fmt.Errorf("imag conj(C)-C: %w", err)
+	}
+	if err = e.Mul(imC, complex(0, 1), imC); err != nil { // i(conj(C) - C)
+		return nil, nil, fmt.Errorf("imag *i: %w", err)
+	}
+	imS := Sc.CopyNew()
+	if err = e.Sub(imS, ctSinC, imS); err != nil { // conj(S) - S
+		return nil, nil, fmt.Errorf("imag conj(S)-S: %w", err)
+	}
+	utils.AlignLevels(e, imC, imS)
+	if err = e.Sub(imC, imS, imC); err != nil { // i(conj(C)-C) - (conj(S)-S)
+		return nil, nil, fmt.Errorf("imag diff: %w", err)
+	}
+	if err = e.Mul(imC, complex(0.5, 0), imC); err != nil { // / 2
+		return nil, nil, fmt.Errorf("imag *1/2: %w", err)
+	}
+	if err = e.Rescale(imC, imC); err != nil {
+		return nil, nil, fmt.Errorf("imag rescale: %w", err)
+	}
+	ctImag = imC
+
 	return ctReal, ctImag, nil
-}
-
-// ctRePart returns Re(z) = (z + conj(z))/2.
-func ctRePart(eval *ckks.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
-	conj := ct.CopyNew()
-	if err := eval.Conjugate(conj, conj); err != nil {
-		return nil, fmt.Errorf("conj: %w", err)
-	}
-	out := ct.CopyNew()
-	if err := eval.Add(out, conj, out); err != nil {
-		return nil, fmt.Errorf("add: %w", err)
-	}
-	if err := eval.Mul(out, complex(0.5, 0), out); err != nil {
-		return nil, fmt.Errorf("mul 1/2: %w", err)
-	}
-	if err := eval.Rescale(out, out); err != nil {
-		return nil, fmt.Errorf("rescale: %w", err)
-	}
-	return out, nil
-}
-
-// ctImPart returns Im(z) = (conj(z) - z)*i/2.
-func ctImPart(eval *ckks.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
-	conj := ct.CopyNew()
-	if err := eval.Conjugate(conj, conj); err != nil {
-		return nil, fmt.Errorf("conj: %w", err)
-	}
-	out := conj.CopyNew()
-	if err := eval.Sub(out, ct, out); err != nil {
-		return nil, fmt.Errorf("sub: %w", err)
-	}
-	if err := eval.Mul(out, complex(0, 0.5), out); err != nil {
-		return nil, fmt.Errorf("mul i/2: %w", err)
-	}
-	if err := eval.Rescale(out, out); err != nil {
-		return nil, fmt.Errorf("rescale: %w", err)
-	}
-	return out, nil
 }
 
 // squareExp applies r double-angle squarings to the real and imaginary parts,

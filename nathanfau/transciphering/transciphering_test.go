@@ -4,6 +4,7 @@ package transciphering
 //   go test ./nathanfau/transciphering/ -run TestTransciphering -v
 //   go test ./nathanfau/transciphering/ -run TestTransciphering -v -rounds 2
 //   go test ./nathanfau/transciphering/ -run TestTransciphering -v -subbytes 3 -mixcolumns 1
+// 	 go test ./nathanfau/transciphering/ -v -subbytes 4 -mixcolumns 2 -rounds 2 -notrick
 
 import (
 	"flag"
