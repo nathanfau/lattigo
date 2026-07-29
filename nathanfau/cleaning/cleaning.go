@@ -22,3 +22,31 @@ func Cleaning(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext)
 	}
 	return out, nil
 }
+
+// SmootherCleaning refines a bit via p(x) = 6x^5-15x^4+10x^3
+// consuming ceil(log2(deg+1)) = 3 levels.
+func SmootherCleaning(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+	poly := bignum.NewPolynomial(bignum.Monomial, []complex128{0, 0, 0, 10, -15, 6}, nil)
+	polyEval := polynomial.NewEvaluator(params, eval)
+
+	W := ct.Scale
+	out, err := polyEval.Evaluate(ct.CopyNew(), poly, W)
+	if err != nil {
+		return nil, fmt.Errorf("Cleaning: %w", err)
+	}
+	return out, nil
+}
+
+// SmootherCleaning refines a bit via p(x) = -20x^7+70x^6-84x^5+35x^4
+// consuming ceil(log2(deg+1)) = 3 levels.
+func VerySmootherCleaning(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+	poly := bignum.NewPolynomial(bignum.Monomial, []complex128{0, 0, 0, 0, 35, -84, 70, -20}, nil)
+	polyEval := polynomial.NewEvaluator(params, eval)
+
+	W := ct.Scale
+	out, err := polyEval.Evaluate(ct.CopyNew(), poly, W)
+	if err != nil {
+		return nil, fmt.Errorf("Cleaning: %w", err)
+	}
+	return out, nil
+}
