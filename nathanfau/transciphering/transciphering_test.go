@@ -1,56 +1,276 @@
 package transciphering
 
-// Run examples:
-//   go test ./nathanfau/transciphering/ -run TestTransciphering -v
-//   go test ./nathanfau/transciphering/ -run TestTransciphering -v -rounds 2
-//   go test ./nathanfau/transciphering/ -run TestTransciphering -v -subbytes 3 -mixcolumns 1
-// 	 go test ./nathanfau/transciphering/ -v -subbytes 4 -mixcolumns 2 -rounds 2 -notrick
+//	go test ./nathanfau/transciphering/ -run '^TestTransciphering$' -v -subbytes 2 -rounds 1 -timeout 0
+//	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -subbytes 2 -timeout 0
 
 import (
 	"flag"
 	"fmt"
-	"sort"
+	"math/rand"
 	"testing"
 	"time"
 
 	"github.com/tuneinsight/lattigo/v6/nathanfau/aes"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/blockpack"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/debug"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 )
 
 var (
 	nRoundsFlag = flag.Int("rounds", 1, "number of AES middle rounds to run")
-	sbVersion   = flag.Int("subbytes", 2, "SubBytes version (1..4)")
-	mcVersion   = flag.Int("mixcolumns", 2, "MixColumns version (1..2)")
-	noTrickFlag = flag.Bool("notrick", false, "use the paper-faithful AES evaluator (no squaring/scale-chain trick)")
+	sbVersion   = flag.Int("subbytes", 2, "SubBytes version (2..4)")
 )
 
-func to16(b []byte) [16]byte {
-	var out [16]byte
-	copy(out[:], b)
-	return out
+// TestTransciphering runs Context.Round on a full batch of DISTINCT random blocks, one per slot,
+// with a slot / chain / precision trace and a row-major AES-oracle comparison after EVERY
+// operation. The packed layout is invariant, so rounds > 1 chain with no return trip.
+func TestTransciphering(t *testing.T) {
+	const logN, k = 11, 4
+
+	n := *nRoundsFlag
+	if n < 1 {
+		n = 1
+	}
+	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d \n", n, *sbVersion)
+
+	ctx, err := NewContext(logN, k)
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	debug.DbgParams("TranscipheringParams", ctx.Params)
+	ciP := ctx.Sw.CiP
+
+	// FIPS-197 key (shared key stream). Each slot carries a DISTINCT random block (real batching);
+	// states[bi] tracks block bi's cleartext state, and entry to round 1 is plaintext XOR rk0.
+	key := [16]byte{0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c}
+	rk := aes.KeyExpansion(key[:])
+
+	seed := time.Now().UnixNano()
+	states := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
+	fmt.Printf("random seed = %d  (%d blocks)\n", seed, len(states))
+	for bi := range states {
+		aes.AddRoundKey(states[bi][:], rk[0])
+	}
+
+	st, err := blockpack.Encrypt(ciP, ctx.EcdCI, ctx.EncCI, states, SubBytesLevel)
+	if err != nil {
+		t.Fatalf("blockpack.Encrypt state: %v", err)
+	}
+
+	rkHE := make([]blockpack.Packed, n+1)
+	for r := 1; r <= n; r++ {
+		rkHE[r] = encRK(t, ctx, rk[r], len(states), ARKLevel)
+	}
+
+	fmt.Println("================ input (entry to round 1) ================")
+	report(ctx, st, states, 0, "input")
+
+	times := map[string][]time.Duration{}
+	tGlobal := time.Now()
+
+	for r := 1; r <= n; r++ {
+		fmt.Printf("\n================ Round %d/%d ================\n", r, n)
+		tRound := time.Now()
+
+		// after times the operation, advances the cleartext oracle by the same one and prints the
+		// trace. Refresh advances it by ShiftRows: the bootstrap keeps the bit values, only the
+		// ShiftRows at the Algo1 pause moves them.
+		after := func(name string, dur time.Duration, out blockpack.Packed) {
+			st = out
+			times[name] = append(times[name], dur)
+			for bi := range states {
+				switch name {
+				case "SubBytes":
+					aes.SubBytes(states[bi][:])
+				case "Refresh":
+					states[bi] = aes.ShiftRowsRM(states[bi])
+				case "MixColumns":
+					states[bi] = aes.MixColumnsRM(states[bi])
+				case "AddRoundKey":
+					aes.AddRoundKey(states[bi][:], rk[r])
+				}
+			}
+			report(ctx, st, states, r, name)
+		}
+
+		if st, err = ctx.Round(st, rkHE[r], *sbVersion, after); err != nil {
+			t.Fatalf("Round T%d: %v", r, err)
+		}
+
+		dRound := time.Since(tRound)
+		times["Round"] = append(times["Round"], dRound)
+		fmt.Printf("  [T%d] round time (incl. oracle traces): %s\n", r, dRound.Round(time.Millisecond))
+	}
+
+	fmt.Printf("\nTOTAL (%d rounds, incl. oracle traces): %s\n", n, time.Since(tGlobal).Round(time.Millisecond))
+	fmt.Println("================ timing stats (per round) ================")
+	// Share reference = sum of the op means, so the ops add up to ~100%; "Round" is the wall time
+	// (ops + oracle traces) and gets no share.
+	ops := []string{"SubBytes", "Refresh", "MixColumns", "AddRoundKey", "Cleaning"}
+	var opMeanSum time.Duration
+	for _, name := range ops {
+		if ds := times[name]; len(ds) > 0 {
+			var sum time.Duration
+			for _, d := range ds {
+				sum += d
+			}
+			opMeanSum += sum / time.Duration(len(ds))
+		}
+	}
+	for _, name := range ops {
+		utils.TimeStats(name, times[name], opMeanSum)
+	}
+	utils.TimeStats("Round", times["Round"])
+
+	if err := blockpack.Check(ciP, ctx.EcdCI, ctx.DecCI, st, states); err != nil {
+		t.Errorf("AES (%d rounds): %v", n, err)
+	} else {
+		fmt.Printf("\n=== OK: %d middle round(s), all %d blocks conform to the row-major AES oracle ===\n", n, len(states))
+	}
 }
 
-// timestats logs min/max/mean/median over a list of per-round durations for one step.
-func timestats(t *testing.T, name string, ds []time.Duration) {
+// TestAES runs the whole cipher on a full batch of DISTINCT random blocks:
+// FirstRound -> 9 * Round -> LastRoundV1, with the oracle checked after EVERY operation.
+func TestAES(t *testing.T) {
+	const logN, k = 11, 4
+
+	if testing.Short() {
+		t.Skip("full AES: 10 rounds, several minutes")
+	}
+
+	ctx, err := NewContext(logN, k)
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	debug.DbgParams("TranscipheringParams", ctx.Params)
+	ciP := ctx.Sw.CiP
+
+	key := [16]byte{0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c}
+	rk := aes.KeyExpansion(key[:])
+	nMiddle := len(rk) - 2 // round 0 is the initial ARK, the last one has no MixColumns
+
+	seed := time.Now().UnixNano()
+	blocks := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
+	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, %d blocks, random seed = %d \n",
+		nMiddle, *sbVersion, len(blocks), seed)
+
+	// The blocks stay in the CLEAR: that is what the client sends and what FirstRound takes.
+	states := make([][16]byte, len(blocks))
+	copy(states, blocks)
+
+	// Three key levels: rk0 lands before SubBytes, the middle keys after MixColumns, the last one
+	// straight out of the refresh since no MixColumns eats into it.
+	rk0 := encRK(t, ctx, rk[0], len(blocks), InitLevel)
+	rkHE := make([]blockpack.Packed, len(rk))
+	for r := 1; r <= nMiddle; r++ {
+		rkHE[r] = encRK(t, ctx, rk[r], len(blocks), ARKLevel)
+	}
+	rkHE[len(rk)-1] = encRK(t, ctx, rk[len(rk)-1], len(blocks), RefreshLevel)
+
+	times := map[string][]time.Duration{}
+	tGlobal := time.Now()
+
+	fmt.Println("\n================ Round 0 (initial ARK) ================")
+	t0 := time.Now()
+	st, err := ctx.FirstRound(blocks, rk0)
+	if err != nil {
+		t.Fatalf("FirstRound: %v", err)
+	}
+	times["FirstRound"] = append(times["FirstRound"], time.Since(t0))
+	for bi := range states {
+		aes.AddRoundKey(states[bi][:], rk[0])
+	}
+	if l := st[0][0].Level(); l != SubBytesLevel {
+		t.Errorf("FirstRound left the state at level %d, want SubBytesLevel %d", l, SubBytesLevel)
+	}
+	report(ctx, st, states, 0, "FirstRound")
+
+	// round and rkNow name the round in flight, so the same hook serves the middle rounds and the
+	// last one. Refresh advances the oracle by ShiftRows: the bootstrap keeps the bit values, only
+	// the ShiftRows at the Algo1 pause moves them.
+	round, rkNow := 0, rk[0]
+	after := func(name string, dur time.Duration, out blockpack.Packed) {
+		st = out
+		times[name] = append(times[name], dur)
+		for bi := range states {
+			switch name {
+			case "SubBytes":
+				aes.SubBytes(states[bi][:])
+			case "Refresh":
+				states[bi] = aes.ShiftRowsRM(states[bi])
+			case "MixColumns":
+				states[bi] = aes.MixColumnsRM(states[bi])
+			case "AddRoundKey":
+				aes.AddRoundKey(states[bi][:], rkNow)
+			}
+		}
+		report(ctx, st, states, round, name)
+	}
+
+	for r := 1; r <= nMiddle; r++ {
+		fmt.Printf("\n================ Round %d/%d ================\n", r, len(rk)-1)
+		round, rkNow = r, rk[r]
+		tRound := time.Now()
+		if st, err = ctx.Round(st, rkHE[r], *sbVersion, after); err != nil {
+			t.Fatalf("Round T%d: %v", r, err)
+		}
+		times["Round"] = append(times["Round"], time.Since(tRound))
+	}
+
+	last := len(rk) - 1
+	fmt.Printf("\n================ Round %d/%d (last, no MixColumns) ================\n", last, last)
+	round, rkNow = last, rk[last]
+	tRound := time.Now()
+	if st, err = ctx.LastRoundV1(st, rkHE[last], *sbVersion, after); err != nil {
+		t.Fatalf("LastRoundV1: %v", err)
+	}
+	times["LastRound"] = append(times["LastRound"], time.Since(tRound))
+
+	fmt.Printf("\nTOTAL AES-128 (incl. oracle traces): %s\n", time.Since(tGlobal).Round(time.Millisecond))
+	fmt.Println("================ timing stats ================")
+	// Share reference = sum of the op means, so the ops add up to ~100%; the round totals are wall
+	// time (ops + oracle traces) and get no share.
+	ops := []string{"SubBytes", "Refresh", "MixColumns", "AddRoundKey", "Cleaning"}
+	var opMeanSum time.Duration
+	for _, name := range ops {
+		if ds := times[name]; len(ds) > 0 {
+			var sum time.Duration
+			for _, d := range ds {
+				sum += d
+			}
+			opMeanSum += sum / time.Duration(len(ds))
+		}
+	}
+	for _, name := range ops {
+		utils.TimeStats(name, times[name], opMeanSum)
+	}
+	utils.TimeStats("FirstRound", times["FirstRound"])
+	utils.TimeStats("Round", times["Round"])
+	utils.TimeStats("LastRound", times["LastRound"])
+
+	if err := blockpack.Check(ciP, ctx.EcdCI, ctx.DecCI, st, states); err != nil {
+		t.Errorf("AES-128: %v", err)
+	} else {
+		fmt.Printf("\n=== OK: full AES-128, all %d blocks conform to the row-major AES oracle ===\n", len(states))
+	}
+}
+
+// encRK packs a round key at the given level: the key stream is shared, so the 16 bytes are
+// replicated over the whole batch and packed exactly like a state.
+func encRK(t *testing.T, ctx *Context, rk []byte, blocks, level int) blockpack.Packed {
 	t.Helper()
-	if len(ds) == 0 {
-		t.Logf("  %-13s (no measure)", name)
-		return
+	repl := make([][16]byte, blocks)
+	for bi := range repl {
+		copy(repl[bi][:], rk)
 	}
-	cp := append([]time.Duration(nil), ds...)
-	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
-	var sum time.Duration
-	for _, d := range cp {
-		sum += d
+	p, err := blockpack.Encrypt(ctx.Sw.CiP, ctx.EcdCI, ctx.EncCI, repl, level)
+	if err != nil {
+		t.Fatalf("encrypt round key at level %d: %v", level, err)
 	}
-	mean := sum / time.Duration(len(cp))
-	med := cp[len(cp)/2]
-	t.Logf("  %-13s min=%s max=%s mean=%s med=%s (n=%d)", name,
-		cp[0].Round(time.Millisecond), cp[len(cp)-1].Round(time.Millisecond),
-		mean.Round(time.Millisecond), med.Round(time.Millisecond), len(cp))
+	return p
 }
 
-// cmp16 counts wrong bytes and returns the first differing index (-1 if equal).
+// cmp16 counts how many bytes differ between got and want and returns the first differing index.
 func cmp16(got, want [16]byte) (wrong, first int) {
 	first = -1
 	for b := 0; b < 16; b++ {
@@ -64,171 +284,44 @@ func cmp16(got, want [16]byte) (wrong, first int) {
 	return
 }
 
-// TestTransciphering runs n AES middle rounds (SubBytes -> refresh(Algo1) -> ShiftRows ->
-// MixColumns -> AddRoundKey -> Cleaning) on an encrypted state, with slot/chain/precision
-// traces and an AES-oracle comparison after every operation (intra-round and between rounds).
-//
-// The number of rounds and the SubBytes / MixColumns versions are set by -rounds, -subbytes
-// and -mixcolumns.
-func TestTransciphering(t *testing.T) {
-	const logN, k = 11, 4
+// report prints the slot + chain of st[0][0], the precision pooled over the 64 ciphertexts, and the
+// whole batch against the oracle.
+func report(ctx *Context, st blockpack.Packed, states [][16]byte, round int, step string) {
+	ciP := ctx.Sw.CiP
+	debug.DbgSlotCI(fmt.Sprintf("T%d %-11s st[0][0] =", round, step), st[0][0])
+	debug.DbgChain(fmt.Sprintf("T%d %-11s chain    :", round, step), ctx.Sw.EvalCI, st[0][0])
 
-	n := *nRoundsFlag
-	if n < 1 {
-		n = 1
+	entries := make([]debug.PrecCt, 0, 64)
+	for g := 0; g < 8; g++ {
+		for b := 0; b < 8; b++ {
+			entries = append(entries, debug.PrecCt{
+				Name: fmt.Sprintf("st[%2d][%d]", g, b),
+				Want: blockpack.SlotVec(ciP, states, g, b),
+				Ct:   st[g][b],
+			})
+		}
 	}
-	fmt.Printf("=== Transciphering: rounds=%d, SubBytes=V%d, MixColumns=V%d, noTrick=%v ===\n", n, *sbVersion, *mcVersion, *noTrickFlag)
+	debug.PrecPoolCI(fmt.Sprintf("T%d %-11s prec (128 bits) :", round, step), entries...)
 
-	ctx, err := NewContext(logN, k, *noTrickFlag, *mcVersion)
+	got, margin, err := blockpack.Decrypt(ciP, ctx.EcdCI, ctx.DecCI, st)
 	if err != nil {
-		t.Fatalf("NewContext: %v", err)
+		fmt.Printf("  [T%d] %-11s ORACLE: decrypt error: %v\n", round, step, err)
+		return
 	}
-
-	// FIPS-197 key / plaintext, used to drive both the HE circuit and the cleartext oracle.
-	key := [16]byte{0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c}
-	pt := [16]byte{0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37, 0x07, 0x34}
-	rk := aes.KeyExpansion(key[:])
-
-	// Oracle state = entry to round 1 (pt XOR rk0). Rounds 1..n are full middle rounds.
-	want := pt
-	aes.AddRoundKey(want[:], rk[0])
-
-	// Input state at the loop level [42, 60, 38, 38, 38, 38] = level 5: 3 levels for SubBytes,
-	// 1 for the CIToStandard conversion, 1 (the 60) for SlotsToCoeffs, before the refresh recharges.
-	const inputLevel = 5
-	keyLevel := ctx.Sw.CiP.MaxLevel()
-	st, err := aes.EncStateRepl(ctx.Sw.CiP, ctx.EcdCI, ctx.EncCI, want, inputLevel)
-	if err != nil {
-		t.Fatalf("EncStateRepl state: %v", err)
-	}
-	rkHE := make([]aes.StateHE, n+1)
-	for r := 1; r <= n; r++ {
-		if rkHE[r], err = aes.EncStateRepl(ctx.Sw.CiP, ctx.EcdCI, ctx.EncCI, to16(rk[r]), keyLevel); err != nil {
-			t.Fatalf("EncStateRepl rk%d: %v", r, err)
+	wrong, firstBad := 0, -1
+	for bi := range states {
+		if got[bi] != states[bi] {
+			wrong++
+			if firstBad < 0 {
+				firstBad = bi
+			}
 		}
 	}
-
-	// dec0 decrypts the state and returns slot 0 (representative of the replicated batch).
-	dec0 := func(s aes.StateHE) [16]byte {
-		outs, derr := aes.DecStateBatch(ctx.Sw.CiP, ctx.EcdCI, ctx.DecCI, s)
-		if derr != nil {
-			t.Fatalf("DecStateBatch: %v", derr)
-		}
-		return outs[0]
+	if wrong == 0 {
+		fmt.Printf("  [T%d] %-11s ORACLE: TRUE all %d blocks (worst bit margin %.4f)\n", round, step, len(states), margin)
+		return
 	}
-
-	// wantBitSlice returns the (replicated) expected value of one state bit for the precision trace.
-	slots := ctx.Sw.CiP.MaxSlots()
-	wantBitSlice := func(byteIdx, bit int) []float64 {
-		v := float64((want[byteIdx] >> uint(bit)) & 1)
-		s := make([]float64, slots)
-		for i := range s {
-			s[i] = v
-		}
-		return s
-	}
-
-	// report dumps slot + chain + precision on two representative bits and compares the whole
-	// decrypted state against the current oracle state.
-	report := func(round int, step string) {
-		debug.DbgSlotCI(fmt.Sprintf("T%d %-11s st[0][0] =", round, step), st[0][0])
-		debug.DbgChain(fmt.Sprintf("T%d %-11s chain    :", round, step), ctx.Sw.EvalCI, st[0][0])
-		debug.PrintPrecCI(fmt.Sprintf("T%d %-11s prec[0][0] :", round, step), wantBitSlice(0, 0), st[0][0])
-		debug.DbgSlotCI(fmt.Sprintf("T%d %-11s st[7][4] =", round, step), st[7][4])
-		debug.PrintPrecCI(fmt.Sprintf("T%d %-11s prec[7][4] :", round, step), wantBitSlice(7, 4), st[7][4])
-
-		got := dec0(st)
-		if w, f := cmp16(got, want); w > 0 {
-			fmt.Printf("  [T%d] %-11s ORACLE: FALSE %2d/16 bytes wrong (first = byte %d)\n            got =%x\n            want=%x\n", round, step, w, f, got, want)
-		} else {
-			fmt.Printf("  [T%d] %-11s ORACLE: TRUE 16/16\n", round, step)
-		}
-	}
-
-	fmt.Println("================ input (entry to round 1) ================")
-	report(0, "input")
-
-	// Timers: per-step durations accumulated across rounds (+ per-round total), plus a global one.
-	times := map[string][]time.Duration{}
-	tGlobal := time.Now()
-
-	for r := 1; r <= n; r++ {
-		fmt.Printf("\n================ Round %d/%d ================\n", r, n)
-		tRound := time.Now()
-
-		// SubBytes
-		fmt.Printf("---- T%d SubBytes (V%d) ----\n", r, *sbVersion)
-		t0 := time.Now()
-		if st, err = ctx.AE.SubBytes(st, *sbVersion); err != nil {
-			t.Fatalf("SubBytes T%d: %v", r, err)
-		}
-		times["SubBytes"] = append(times["SubBytes"], time.Since(t0))
-		aes.SubBytes(want[:])
-		report(r, "SubBytes")
-
-		// Refresh (Algo1). The bootstrap preserves the bit values, so the oracle is unchanged.
-		fmt.Printf("---- T%d Refresh (Algo1) ----\n", r)
-		t0 = time.Now()
-		if st, err = ctx.RefreshState(st); err != nil {
-			t.Fatalf("RefreshState T%d: %v", r, err)
-		}
-		times["Refresh"] = append(times["Refresh"], time.Since(t0))
-		report(r, "Refresh")
-
-		// ShiftRows
-		fmt.Printf("---- T%d ShiftRows ----\n", r)
-		t0 = time.Now()
-		st = aes.ShiftRowsHE(st)
-		times["ShiftRows"] = append(times["ShiftRows"], time.Since(t0))
-		aes.ShiftRows(want[:])
-		report(r, "ShiftRows")
-
-		// MixColumns
-		fmt.Printf("---- T%d MixColumns (V%d) ----\n", r, *mcVersion)
-		t0 = time.Now()
-		if st, err = ctx.AE.MixColumns(st, *mcVersion); err != nil {
-			t.Fatalf("MixColumns T%d: %v", r, err)
-		}
-		times["MixColumns"] = append(times["MixColumns"], time.Since(t0))
-		aes.MixColumns(want[:])
-		report(r, "MixColumns")
-
-		// AddRoundKey. The fresh round key is at MaxLevel while the state is deep, so it must be
-		// canonicalized (DropLevel to the state level) first: otherwise trick-mode xor aligns by
-		// squaring the key ~(MaxLevel-stateLevel) times and blows up its noise.
-		fmt.Printf("---- T%d AddRoundKey ----\n", r)
-		t0 = time.Now()
-		if st, err = ctx.AddRoundKeyCanon(st, rkHE[r]); err != nil {
-			t.Fatalf("AddRoundKey T%d: %v", r, err)
-		}
-		times["AddRoundKey"] = append(times["AddRoundKey"], time.Since(t0))
-		aes.AddRoundKey(want[:], rk[r])
-		report(r, "AddRoundKey")
-
-		// Cleaning. Snaps bits to 0/1, oracle unchanged.
-		fmt.Printf("---- T%d Cleaning ----\n", r)
-		t0 = time.Now()
-		if st, err = ctx.CleanState(st); err != nil {
-			t.Fatalf("Cleaning T%d: %v", r, err)
-		}
-		times["Cleaning"] = append(times["Cleaning"], time.Since(t0))
-		report(r, "Cleaning")
-
-		dRound := time.Since(tRound)
-		times["Round"] = append(times["Round"], dRound)
-		fmt.Printf("  [T%d] round time (excl. oracle traces): %s\n", r, dRound.Round(time.Millisecond))
-	}
-
-	fmt.Printf("\nTOTAL (%d rounds, incl. oracle traces): %s\n", n, time.Since(tGlobal).Round(time.Millisecond))
-	fmt.Println("================ timing stats (per round) ================")
-	for _, name := range []string{"SubBytes", "Refresh", "ShiftRows", "MixColumns", "AddRoundKey", "Cleaning", "Round"} {
-		timestats(t, name, times[name])
-	}
-
-	got := dec0(st)
-	if got != want {
-		t.Errorf("AES HE (%d rounds): got=%x want=%x", n, got, want)
-	} else {
-		fmt.Printf("\n=== OK: %d middle rounds conform to the AES oracle (16/16) ===\n", n)
-	}
+	w, f := cmp16(got[firstBad], states[firstBad])
+	fmt.Printf("  [T%d] %-11s ORACLE: FALSE %d/%d blocks wrong (worst bit margin %.4f; first bad block %d: %d/16 bytes, first byte %d)\n            got =%x\n            want=%x\n",
+		round, step, wrong, len(states), margin, firstBad, w, f, got[firstBad], states[firstBad])
 }

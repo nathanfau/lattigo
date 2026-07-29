@@ -4,11 +4,13 @@
 // One "middle" round (neither the first AddRoundKey-only round nor the last MixColumns-less
 // round) is:
 //
-//	SubBytes -> refresh(Algo1) -> ShiftRows -> MixColumns -> AddRoundKey -> Cleaning
+//	SubBytes -> Refresh(Algo1, ShiftRows at the pause) -> MixColumns -> AddRoundKey -> Cleaning
+//
+// Context.Round runs that sequence; each operation is exported on its own as well.
 //
 // The AES circuit runs in the conjugate-invariant (CI, real) context of the CtxSwitcher; the
 // refresh round-trips each bit CI -> Std, packs k bits per ciphertext, bootstraps with Algo1,
-// extracts the bits back, and returns to CI. SubBytes and MixColumns versions are selectable.
+// extracts the bits back, and returns to CI. The SubBytes version is selectable.
 package transciphering
 
 import (
@@ -16,25 +18,19 @@ import (
 	"time"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
-	"github.com/tuneinsight/lattigo/v6/circuits/ckks/dft"
-	"github.com/tuneinsight/lattigo/v6/circuits/ckks/mod1"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/aes"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/algo1"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/bitbatching"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/blockpack"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/cleaning"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/convctx"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/debug"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/params2"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
-	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
-
-	"math/big"
 )
 
-// Context bundles every piece needed to run the AES + refresh pipeline: the Std bootstrapping
-// parameters/evaluator, the CtxSwitcher (CI <-> Std), the CI-context AES evaluator, and the CI
-// encoder/encryptor/decryptor for the state.
 type Context struct {
 	Params ckks.Parameters // Std bootstrapping / residual parameters
 	Eval   *bootstrapping.Evaluator
@@ -50,12 +46,20 @@ type Context struct {
 	Canon  rlwe.Scale // canonical output scale after refresh
 }
 
-// NewContext builds the whole machinery on the algo1 moduli chain (same setup as the algo1
-// test). The AES state lives in the CI ring (sw.CiP); the bootstrap runs in the Std ring.
-func NewContext(logN, k int, noTrick bool, mcVersion int) (*Context, error) {
-	params, btpParams, err := buildBtpParams(logN, k, mcVersion)
+const (
+	SubBytesLevel = 5  // state level entering a round
+	InitLevel     = 6  // rk0 and the encoded blocks: SubBytesLevel + 1, the square of the XOR
+	RefreshLevel  = 12 // level the refresh hands the state back at
+	ARKLevel      = 9  // RefreshLevel - 3, the depth of MixColumns' XOR tree
+)
+
+// NewContext builds the whole machinery on the algo1 moduli chain.
+// The AES state lives in the CI ring (sw.CiP)
+// The bootstrap runs in the Std ring
+func NewContext(logN, k int) (*Context, error) {
+	params, btpParams, err := params2.TranscipheringParams(logN, k)
 	if err != nil {
-		return nil, fmt.Errorf("buildBtpParams: %w", err)
+		return nil, fmt.Errorf("TranscipheringParams: %w", err)
 	}
 
 	sk := rlwe.NewKeyGenerator(params).GenSecretKeyNew()
@@ -81,9 +85,6 @@ func NewContext(logN, k int, noTrick bool, mcVersion int) (*Context, error) {
 	fmt.Printf("Done !(%s)\n", time.Since(t0).Round(time.Millisecond))
 
 	ae := aes.NewEvaluator(sw.EvalCI)
-	if noTrick {
-		ae = aes.NewEvaluatorNoTrick(sw.EvalCI)
-	}
 
 	c := &Context{
 		Params: params,
@@ -105,213 +106,271 @@ func NewContext(logN, k int, noTrick bool, mcVersion int) (*Context, error) {
 	return c, nil
 }
 
-// buildBtpParams builds the Std CKKS parameters and bootstrapping parameters on the algo1
-// moduli chain. The chain is annotated per pipeline step; the user tunes the q_i.
-func buildBtpParams(logN, k, mcVersion int) (ckks.Parameters, bootstrapping.Parameters, error) {
-	logQ := []int{42}
-	logQ = append(logQ, 60)         // SlotsToCoeffs
-	logQ = append(logQ, 38)         // Conv_{Real->Cplx}
-	logQ = append(logQ, 38, 38, 38) // SubBytes
-	logQ = append(logQ, 38, 38)     // cleaning
-	logQ = append(logQ, 38)         // AddRoundKey
-	logQ = append(logQ, 38, 38, 38) // MixColumns (V2 depth 3)
-	if mcVersion == 1 {
-		logQ = append(logQ, 38) // MixColumnsV1 (depth 4) consumes 1 more level
+// FirstRound is AES round 0: it XORs rk0 into the AES blocks. The blocks arrive in the CLEAR,
+// so the 'server' encodes them itself and the XOR is ciphertext against plaintext.
+// rk0 must be at InitLevel.
+func (c *Context) FirstRound(blocks [][16]byte, rk0 blockpack.Packed) (blockpack.Packed, error) {
+	if l := rk0[0][0].Level(); l != InitLevel {
+		return blockpack.Packed{}, fmt.Errorf("FirstRound: rk0 at level %d, want InitLevel %d", l, InitLevel)
 	}
-	// refresh
-	logQ = append(logQ, 38)                 // Conv_{Cplx->Real}
-	logQ = append(logQ, 38, 38, 38, 38, 38) // 5 levels for BitExtract
-	logQ = append(logQ, 38, 38, 38)         // 3 levels for squaring
-	logQ = append(logQ, 38)                 // extractExp
-	logQ = append(logQ, 38)                 // Conv_{Real->Cplx}
-	logQ = append(logQ, 38, 38, 38, 38, 38) // EvalCos
-	logQ = append(logQ, 38)                 // Conv_{Cplx->Real}
-	logQ = append(logQ, 38, 38, 38)         // CoeffsToSlots
+	eval := c.Sw.EvalCI
 
-	ciBase, err := ckks.NewParametersFromLiteral(ckks.ParametersLiteral{
-		LogN:            logN,
-		LogQ:            logQ,
-		LogP:            []int{61, 61, 61, 61, 61, 61, 50},
-		LogDefaultScale: 38,
-		Xs:              ring.Ternary{H: 256},
-		RingType:        ring.ConjugateInvariant,
-	})
-	if err != nil {
-		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("ci params: %w", err)
+	var out blockpack.Packed
+	for g := 0; g < 8; g++ {
+		for b := 0; b < 8; b++ {
+			pt := ckks.NewPlaintext(c.Sw.CiP, InitLevel)
+			pt.Scale = rk0[g][b].Scale
+			if err := c.EcdCI.Encode(blockpack.SlotVec(c.Sw.CiP, blocks, g, b), pt); err != nil {
+				return blockpack.Packed{}, fmt.Errorf("FirstRound encode [%d][%d]: %w", g, b, err)
+			}
+			x, err := eval.SubNew(rk0[g][b], pt)
+			if err != nil {
+				return blockpack.Packed{}, fmt.Errorf("FirstRound sub [%d][%d]: %w", g, b, err)
+			}
+			if err := eval.MulRelin(x, x, x); err != nil {
+				return blockpack.Packed{}, fmt.Errorf("FirstRound square [%d][%d]: %w", g, b, err)
+			}
+			if err := eval.Rescale(x, x); err != nil {
+				return blockpack.Packed{}, fmt.Errorf("FirstRound rescale [%d][%d]: %w", g, b, err)
+			}
+			out[g][b] = x
+		}
 	}
-	stdLit := ciBase.ParametersLiteral()
-	stdLit.RingType = ring.Standard
-	params, err := ckks.NewParametersFromLiteral(stdLit)
-	if err != nil {
-		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("std params: %w", err)
-	}
-
-	// SlotsToCoeffs (homomorphic decoding).
-	S2CParams := dft.MatrixLiteral{
-		Type:     dft.HomomorphicDecode,
-		LogSlots: params.LogMaxSlots(),
-		LevelP:   params.MaxLevelP(),
-		Levels:   []int{1},
-	}
-	S2CParams.LevelQ = len(S2CParams.Levels)
-
-	// CoeffsToSlots (homomorphic encoding), real and imaginary parts split.
-	C2SParams := dft.MatrixLiteral{
-		Type:     dft.HomomorphicEncode,
-		Format:   dft.SplitRealAndImag,
-		LogSlots: params.LogMaxSlots(),
-		LevelQ:   params.MaxLevel(),
-		LevelP:   params.MaxLevelP(),
-		Levels:   []int{1, 1, 1},
-	}
-
-	Mod1Params := mod1.ParametersLiteral{
-		LevelQ:          params.MaxLevel() - C2SParams.Depth(true),
-		LogScale:        38,
-		Mod1Type:        mod1.CosDiscrete,
-		Mod1Degree:      2 * ((1 << k) - 1),
-		K:               1 << k,
-		LogMessageRatio: k,
-	}
-	mod1P, err := mod1.NewParametersFromLiteral(params, Mod1Params)
-	if err != nil {
-		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("mod1 params: %w", err)
-	}
-	F := (mod1P.ScalingFactor().Float64() / mod1P.MessageRatio()) / params.DefaultScale().Float64()
-	S2CParams.Scaling = big.NewFloat(F)
-
-	btpParams := bootstrapping.Parameters{
-		ResidualParameters:      params,
-		BootstrappingParameters: params,
-		SlotsToCoeffsParameters: S2CParams,
-		Mod1ParametersLiteral:   Mod1Params,
-		CoeffsToSlotsParameters: C2SParams,
-		EphemeralSecretWeight:   32,
-		CircuitOrder:            bootstrapping.DecodeThenModUp,
-	}
-	return params, btpParams, nil
+	return out, nil
 }
 
-// RefreshState refreshes the 128 bits of a CI state in groups of k via the CI->Std bridge,
-// Algo1, BitExtract on both streams, recombination, and Std->CI return with a canonical scale.
-func (c *Context) RefreshState(st aes.StateHE) (aes.StateHE, error) {
+// SubBytes applies the selected SubByte version to the whole state, i.e. to all 64 ciphertexts.
+func (c *Context) SubBytes(st blockpack.Packed, version int) (blockpack.Packed, error) {
+	var out blockpack.Packed
+	for g := 0; g < 8; g++ {
+		t0 := time.Now()
+		ob, err := c.AE.SubByte(st[g], version)
+		if err != nil {
+			return blockpack.Packed{}, fmt.Errorf("SubBytes group %d (v%d): %w", g, version, err)
+		}
+		fmt.Printf("[SubBytes v%d] group %2d/8 done (%s)\n", version, g+1, time.Since(t0).Round(time.Millisecond))
+		out[g] = ob
+	}
+	return out, nil
+}
+
+// Refresh refreshes the whole state and applies ShiftRows at the Algo1 pause
+func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 	eval := c.Eval
+	ck := eval.Evaluator
 
-	// Flatten the 128 bits (order [byte][bit]).
-	flat := make([]*rlwe.Ciphertext, 0, 128)
-	for b := 0; b < 16; b++ {
-		for i := 0; i < 8; i++ {
-			flat = append(flat, st[b][i])
-		}
-	}
-
-	// 1. CI -> Std bridge (z_j = A_j + i*B_j).
-	stdFlat := make([]*rlwe.Ciphertext, len(flat))
-	for i, ct := range flat {
-		s, err := c.Sw.CIToStandard(ct)
-		if err != nil {
-			return aes.StateHE{}, fmt.Errorf("RefreshState CIToStandard %d: %w", i, err)
-		}
-		stdFlat[i] = s
-	}
-
-	// 2. Pack into 128/k integers m_A + i*m_B.
-	groups, err := bitbatching.BitPackGroups(eval.Evaluator, stdFlat, c.K)
-	if err != nil {
-		return aes.StateHE{}, fmt.Errorf("RefreshState BitPackGroups: %w", err)
-	}
-
-	outFlat := make([]*rlwe.Ciphertext, len(flat))
-	for g, ctPack := range groups {
-		tPkt := time.Now()
-		if d := ctPack.Level() - c.Target; d > 0 {
-			eval.Evaluator.DropLevel(ctPack, d)
-		}
-		// 3. Algo1 (bootstrap) on the packed integers.
-		ctReal, ctImag, err := algo1.Algo1(eval, c.Sw, ctPack, c.K)
-		if err != nil {
-			return aes.StateHE{}, fmt.Errorf("RefreshState Algo1 group %d: %w", g, err)
-		}
-		// 4. BitExtract each stream.
-		bitsA, err := bitbatching.BitExtract(c.Params, eval.Evaluator, ctReal, c.K)
-		if err != nil {
-			return aes.StateHE{}, fmt.Errorf("RefreshState BitExtract A group %d: %w", g, err)
-		}
-		bitsB, err := bitbatching.BitExtract(c.Params, eval.Evaluator, ctImag, c.K)
-		if err != nil {
-			return aes.StateHE{}, fmt.Errorf("RefreshState BitExtract B group %d: %w", g, err)
-		}
-
-		// 5. Recombine + Std -> CI + canonical scale.
-		for i := 0; i < c.K; i++ {
-			z, err := utils.CombineReIm(eval.Evaluator, bitsA[i], bitsB[i])
+	// 1. CI -> Std, per bit.
+	var stdFold [8][8]*rlwe.Ciphertext
+	for g := 0; g < 8; g++ {
+		for b := 0; b < 8; b++ {
+			s, err := c.Sw.CIToStandard(st[g][b])
 			if err != nil {
-				return aes.StateHE{}, fmt.Errorf("RefreshState combineReIm group %d bit %d: %w", g, i, err)
+				return blockpack.Packed{}, fmt.Errorf("refresh CIToStandard [%d][%d]: %w", g, b, err)
+			}
+			stdFold[g][b] = s
+		}
+	}
+
+	// 2. BitPack 4-bit nibbles: packet 2g = low nibble (bits 0..3), 2g+1 = high nibble (bits 4..7);
+	//    each packet is byte_g(nibble) + i*byte_{g+8}(nibble).
+	var packed [16]*rlwe.Ciphertext
+	for g := 0; g < 8; g++ {
+		lo, err := bitbatching.BitPack(ck, stdFold[g][0:4])
+		if err != nil {
+			return blockpack.Packed{}, fmt.Errorf("refresh BitPack low g=%d: %w", g, err)
+		}
+		hi, err := bitbatching.BitPack(ck, stdFold[g][4:8])
+		if err != nil {
+			return blockpack.Packed{}, fmt.Errorf("refresh BitPack high g=%d: %w", g, err)
+		}
+		packed[2*g], packed[2*g+1] = lo, hi
+	}
+
+	// 3. algo1.Extract per packet (drop to the Algo1 input level first).
+	var reals, imags [16]*rlwe.Ciphertext
+	for p := 0; p < 16; p++ {
+		tPkt := time.Now()
+		if d := packed[p].Level() - c.Target; d > 0 {
+			ck.DropLevel(packed[p], d)
+		}
+		rr, ii, err := algo1.Extract(eval, c.Sw, packed[p], c.K)
+		if err != nil {
+			return blockpack.Packed{}, fmt.Errorf("refresh Extract packet %d: %w", p, err)
+		}
+		reals[p], imags[p] = rr, ii
+		fmt.Printf("[refresh] extract packet %2d/16 done (%s)\n", p+1, time.Since(tPkt).Round(time.Millisecond))
+	}
+
+	// 4. ShiftRows at the pause: pure pointer moves on the 32 packed nibbles.
+	re, im := c.AE.ShiftRows(reals, imags)
+
+	// 5. algo1.Resume: the double-angle squarings, on all 32 nibbles (square is pointwise, commutes
+	//    with the ShiftRows permutation).
+	for k := 0; k < 16; k++ {
+		if err := algo1.Resume(eval, re[k], im[k]); err != nil {
+			return blockpack.Packed{}, fmt.Errorf("refresh Resume %d: %w", k, err)
+		}
+	}
+
+	// 6. BitExtract each nibble, CombineReIm (real byte + i*imag byte), Std -> CI, canonical scale.
+	var out blockpack.Packed
+	for j := 0; j < 8; j++ {
+		aLo, err := bitbatching.BitExtract(c.Params, ck, re[2*j], c.K)
+		if err != nil {
+			return blockpack.Packed{}, fmt.Errorf("refresh BitExtract re low j=%d: %w", j, err)
+		}
+		aHi, err := bitbatching.BitExtract(c.Params, ck, re[2*j+1], c.K)
+		if err != nil {
+			return blockpack.Packed{}, fmt.Errorf("refresh BitExtract re high j=%d: %w", j, err)
+		}
+		bLo, err := bitbatching.BitExtract(c.Params, ck, im[2*j], c.K)
+		if err != nil {
+			return blockpack.Packed{}, fmt.Errorf("refresh BitExtract im low j=%d: %w", j, err)
+		}
+		bHi, err := bitbatching.BitExtract(c.Params, ck, im[2*j+1], c.K)
+		if err != nil {
+			return blockpack.Packed{}, fmt.Errorf("refresh BitExtract im high j=%d: %w", j, err)
+		}
+		aBits := append(append([]*rlwe.Ciphertext{}, aLo...), aHi...) // 8 bits of the real byte
+		bBits := append(append([]*rlwe.Ciphertext{}, bLo...), bHi...) // 8 bits of the imag byte
+		for beta := 0; beta < 8; beta++ {
+			z, err := utils.CombineReIm(ck, aBits[beta], bBits[beta])
+			if err != nil {
+				return blockpack.Packed{}, fmt.Errorf("refresh CombineReIm j=%d beta=%d: %w", j, beta, err)
 			}
 			ci, err := c.Sw.StandardToCI(z)
 			if err != nil {
-				return aes.StateHE{}, fmt.Errorf("RefreshState StandardToCI group %d bit %d: %w", g, i, err)
+				return blockpack.Packed{}, fmt.Errorf("refresh StandardToCI j=%d beta=%d: %w", j, beta, err)
 			}
 			ci.Scale = c.Canon
-			outFlat[g*c.K+i] = ci
+			out[j][beta] = ci
 		}
-		fmt.Printf("   [refresh] packet %2d/%d done (%s)\n", g+1, len(groups), time.Since(tPkt).Round(time.Millisecond))
-	}
-
-	// Reassemble the state.
-	var out aes.StateHE
-	for b := 0; b < 16; b++ {
-		for i := 0; i < 8; i++ {
-			out[b][i] = outFlat[b*8+i]
-		}
+		fmt.Printf("[refresh] recombine group %2d/8 done\n", j+1)
 	}
 	return out, nil
 }
 
-// AddRoundKeyCanon brings the round key to the state's (level, scale) with DropLevel + SetScale
-// BEFORE the XOR. This is required: by AddRoundKey time the state is deep (low level) while the
-// fresh round key sits at MaxLevel; the trick-mode xor aligns by squaring, which would square the
-// key ~(MaxLevel - stateLevel) times in a row and blow up its encryption noise ((1+eps)^(2^n)).
-// DropLevel descends the key without squaring, so no amplification. SetScale is applied only when
-// the scale differs (it is an unconditional Mul+Rescale that would destroy the value at ratio
-// 1.0), aiming one level above so the key lands exactly at the state level.
-func (c *Context) AddRoundKeyCanon(st, rkHE aes.StateHE) (aes.StateHE, error) {
-	L := st[0][0].Level()
-	S := st[0][0].Scale
-	var rkCanon aes.StateHE
-	for b := 0; b < 16; b++ {
-		for i := 0; i < 8; i++ {
-			ct := rkHE[b][i].CopyNew()
-			needScale := !ct.Scale.Equal(S)
-			target := L
-			if needScale {
-				target = L + 1
-			}
-			if d := ct.Level() - target; d > 0 {
-				c.Sw.EvalCI.DropLevel(ct, d)
-			}
-			if needScale {
-				if err := c.Sw.EvalCI.SetScale(ct, S); err != nil {
-					return aes.StateHE{}, fmt.Errorf("AddRoundKeyCanon SetScale byte %d bit %d: %w", b, i, err)
-				}
-			}
-			rkCanon[b][i] = ct
-		}
+// AddRoundKey XORs the round key into the state, bit by bit. rk must already be at ARKLevel
+func (c *Context) AddRoundKey(st, rk blockpack.Packed) (blockpack.Packed, error) {
+	if kl, sl := rk[0][0].Level(), st[0][0].Level(); kl != sl {
+		return blockpack.Packed{}, fmt.Errorf("AddRoundKey: round key at level %d, state at level %d", kl, sl)
 	}
-	return c.AE.AddRoundKey(st, rkCanon)
-}
-
-// CleanState snaps every bit of the state to 0/1 (CI context).
-func (c *Context) CleanState(st aes.StateHE) (aes.StateHE, error) {
-	var out aes.StateHE
-	for b := 0; b < 16; b++ {
-		for i := 0; i < 8; i++ {
-			cc, err := cleaning.Cleaning(c.Sw.CiP, c.Sw.EvalCI, st[b][i])
+	var out blockpack.Packed
+	for g := 0; g < 8; g++ {
+		for b := 0; b < 8; b++ {
+			x, err := c.AE.Xor(st[g][b], rk[g][b])
 			if err != nil {
-				return aes.StateHE{}, fmt.Errorf("CleanState byte %d bit %d: %w", b, i, err)
+				return blockpack.Packed{}, fmt.Errorf("AddRoundKey xor [%d][%d]: %w", g, b, err)
 			}
-			out[b][i] = cc
+			out[g][b] = x
 		}
 	}
 	return out, nil
+}
+
+// Clean pulls every bit of the state back onto 0 and 1 after the round has spread them.
+// Th second order cleaning function is used here(SmootherCleaning), see discussion in []
+func (c *Context) Clean(st blockpack.Packed) (blockpack.Packed, error) {
+	var out blockpack.Packed
+	for g := 0; g < 8; g++ {
+		for b := 0; b < 8; b++ {
+			cc, err := cleaning.SmootherCleaning(c.Sw.CiP, c.Sw.EvalCI, st[g][b])
+			if err != nil {
+				return blockpack.Packed{}, fmt.Errorf("Clean [%d][%d]: %w", g, b, err)
+			}
+			out[g][b] = cc
+		}
+	}
+	return out, nil
+}
+
+// RoundStep is called after each operation of a middle round: its name, its duration, the state it
+// produced. That is where a caller hooks its timings and its oracle checks; nil skips it.
+type RoundStep func(name string, dur time.Duration, st blockpack.Packed)
+
+// Round advances the packed state by one AES middle round: SubBytes -> Refresh -> MixColumns ->
+// AddRoundKey -> Cleaning. rk is the round key at ARKLevel, version the SubByte variant (2..4).
+func (c *Context) Round(st, rk blockpack.Packed, version int, after RoundStep) (blockpack.Packed, error) {
+	if after == nil {
+		after = func(string, time.Duration, blockpack.Packed) {}
+	}
+	var err error
+
+	fmt.Println("---- SubBytes ----")
+	t0 := time.Now()
+	if st, err = c.SubBytes(st, version); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("Round SubBytes: %w", err)
+	}
+	after("SubBytes", time.Since(t0), st)
+
+	fmt.Println("---- Refresh ----")
+	t0 = time.Now()
+	if st, err = c.Refresh(st); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("Round Refresh: %w", err)
+	}
+	after("Refresh", time.Since(t0), st)
+
+	fmt.Println("---- MixColumns ----")
+	t0 = time.Now()
+	if st, err = c.AE.MixColumns(st); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("Round MixColumns: %w", err)
+	}
+	after("MixColumns", time.Since(t0), st)
+
+	fmt.Println("---- AddRoundKey ----")
+	t0 = time.Now()
+	if st, err = c.AddRoundKey(st, rk); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("Round AddRoundKey: %w", err)
+	}
+	after("AddRoundKey", time.Since(t0), st)
+
+	fmt.Println("---- Cleaning ----")
+	t0 = time.Now()
+	if st, err = c.Clean(st); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("Round Cleaning: %w", err)
+	}
+	after("Cleaning", time.Since(t0), st)
+
+	return st, nil
+}
+
+// LastRoundV1 is AES round 10: Round without MixColumns. ShiftRows still has to happen, and it stays
+// inside the Refresh -- on a packed state, swapping the Re/Im halves of a group would take a
+// half-slot rotation. Skipping MixColumns means the state reaches
+// AddRoundKey at RefreshLevel, so rk must be encrypted there and NOT at ARKLevel.
+func (c *Context) LastRoundV1(st, rk blockpack.Packed, version int, after RoundStep) (blockpack.Packed, error) {
+	if after == nil {
+		after = func(string, time.Duration, blockpack.Packed) {}
+	}
+	var err error
+
+	fmt.Println("---- SubBytes ----")
+	t0 := time.Now()
+	if st, err = c.SubBytes(st, version); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("LastRoundV1 SubBytes: %w", err)
+	}
+	after("SubBytes", time.Since(t0), st)
+
+	fmt.Println("---- Refresh ----")
+	t0 = time.Now()
+	if st, err = c.Refresh(st); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("LastRoundV1 Refresh: %w", err)
+	}
+	after("Refresh", time.Since(t0), st)
+
+	fmt.Println("---- AddRoundKey ----")
+	t0 = time.Now()
+	if st, err = c.AddRoundKey(st, rk); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("LastRoundV1 AddRoundKey: %w", err)
+	}
+	after("AddRoundKey", time.Since(t0), st)
+
+	fmt.Println("---- Cleaning ----")
+	t0 = time.Now()
+	if st, err = c.Clean(st); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("LastRoundV1 Cleaning: %w", err)
+	}
+	after("Cleaning", time.Since(t0), st)
+
+	return st, nil
 }
