@@ -53,3 +53,8 @@ _testmain.go
 # generated
 /Coding
 
+
+# archive locale free-XOR / XBOOT (jamais poussée)
+nathanfau/_freexor/
+nathanfau/_old/
+nathanfau/_scale33/
