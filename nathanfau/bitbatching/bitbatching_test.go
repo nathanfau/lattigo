@@ -48,8 +48,8 @@ func newTestContext(t *testing.T) (ckks.Parameters, *ckks.Encoder, *rlwe.Encrypt
 	return params, ecd, enc, dec, eval
 }
 
-// encryptBit encrypts a full slot vector
-func encryptBit(t *testing.T, params ckks.Parameters, ecd *ckks.Encoder, enc *rlwe.Encryptor, vals []float64) *rlwe.Ciphertext {
+// encryptVec encrypts a full complex slot vector.
+func encryptVec(t *testing.T, params ckks.Parameters, ecd *ckks.Encoder, enc *rlwe.Encryptor, vals []complex128) *rlwe.Ciphertext {
 	t.Helper()
 	pt := ckks.NewPlaintext(params, params.MaxLevel())
 	if err := ecd.Encode(vals, pt); err != nil {
@@ -76,33 +76,47 @@ func decodeReal(t *testing.T, ecd *ckks.Encoder, dec *rlwe.Decryptor, ct *rlwe.C
 	return re
 }
 
-// TestBitPack: encrypt the k bit-planes of random integers m, pack them, and check
-// the packed ciphertext decrypts to m = sum_i b_i * 2^i.
+// decodeComplex decrypts ct and returns the complex value of each slot.
+func decodeComplex(t *testing.T, ecd *ckks.Encoder, dec *rlwe.Decryptor, ct *rlwe.Ciphertext) []complex128 {
+	t.Helper()
+	out := make([]complex128, ct.Slots())
+	if err := ecd.Decode(dec.DecryptNew(ct), out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return out
+}
+
+// TestBitPack: each of the k planes is a *complex* bit (0/1) + i*(0/1), the real bit from a
+// k-bit integer m_A and the imaginary bit from a k-bit integer m_B, as produced by the blockpack
+// fold (byte g in the real half, byte g+8 in the imaginary half). Pack the k planes and check
+// the packed ciphertext decrypts to m_A + i*m_B, with m_A = sum_i bitA_i*2^i (resp. m_B).
 func TestBitPack(t *testing.T) {
 	params, ecd, enc, dec, eval := newTestContext(t)
 	k := testK
 	n := params.MaxSlots()
 	rng := rand.New(rand.NewSource(time.Now().UnixNano())) // *random* seed for testing
 
-	m := make([]int, n)
-	planes := make([][]float64, k)
+	mA := make([]int, n)
+	mB := make([]int, n)
+	planes := make([][]complex128, k)
 	for i := range planes {
-		planes[i] = make([]float64, n)
+		planes[i] = make([]complex128, n)
 	}
 	for s := 0; s < n; s++ {
-		m[s] = rng.Intn(1 << k)
+		mA[s] = rng.Intn(1 << k)
+		mB[s] = rng.Intn(1 << k)
 		for i := 0; i < k; i++ {
-			planes[i][s] = float64((m[s] >> i) & 1)
+			planes[i][s] = complex(float64((mA[s]>>i)&1), float64((mB[s]>>i)&1))
 		}
 	}
 
 	for i := 0; i < k; i++ {
-		fmt.Printf("planes[%d] = %f\n", i, planes[i][:2])
+		fmt.Printf("planes[%d] = %v\n", i, planes[i][:2])
 	}
 
 	bits := make([]*rlwe.Ciphertext, k)
 	for i := 0; i < k; i++ {
-		bits[i] = encryptBit(t, params, ecd, enc, planes[i])
+		bits[i] = encryptVec(t, params, ecd, enc, planes[i])
 	}
 
 	for i := 0; i < k; i++ {
@@ -116,14 +130,15 @@ func TestBitPack(t *testing.T) {
 
 	debug.DbgSlotStd("BitPack =", ctPack)
 
-	got := decodeReal(t, ecd, dec, ctPack)
+	got := decodeComplex(t, ecd, dec, ctPack)
 	maxErr := 0.0
 	for s := 0; s < n; s++ {
-		if e := math.Abs(got[s] - float64(m[s])); e > maxErr {
+		want := complex(float64(mA[s]), float64(mB[s]))
+		if e := cmplx.Abs(got[s] - want); e > maxErr {
 			maxErr = e
 		}
 	}
-	t.Logf("bitPack max error = %.3e", maxErr)
+	t.Logf("bitPack max error (|m_A+i*m_B|) = %.3e", maxErr)
 	if maxErr > 0.1 {
 		t.Fatalf("bitPack: max error %.3e too large", maxErr)
 	}
