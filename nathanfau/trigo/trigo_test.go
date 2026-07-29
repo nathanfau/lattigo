@@ -31,6 +31,7 @@ func newTrigoContext(t *testing.T) (ckks.Parameters, *ckks.Encoder, *rlwe.Encryp
 	if err != nil {
 		t.Fatalf("params: %v", err)
 	}
+	debug.DbgParams("trigo", params)
 	kgen := rlwe.NewKeyGenerator(params)
 	sk, pk := kgen.GenKeyPairNew()
 	rlk := kgen.GenRelinearizationKeyNew(sk)
