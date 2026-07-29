@@ -29,27 +29,32 @@ const (
 // step1 performs step 1 of Algorithm 1, that is CTS after ModRaise after STC(ct),
 // and recombines the real and imaginary halves into one complex ciphertext.
 func step1(eval *bootstrapping.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
-	//debug.DbgChain("  step1 in       :", eval.Evaluator, ct)
+
+	//debug.DbgSlotStd("step1 in:", ct)
+	//debug.DbgChain("step1 in:", eval.Evaluator, ct)
 
 	ctSTC, err := eval.SlotsToCoeffs(ct, nil)
 	if err != nil {
 		return nil, fmt.Errorf("step1 SlotsToCoeffs: %w", err)
 	}
-	//debug.DbgCoeff("  after STC      :", ctSTC)
-	//debug.DbgChain("  after STC      :", eval.Evaluator, ctSTC)
+
+	//debug.DbgCoeff("after STC:", ctSTC)
+	//debug.DbgChain("after STC:", eval.Evaluator, ctSTC)
 
 	ctSD, _, err := eval.ScaleDown(ctSTC)
 	if err != nil {
 		return nil, fmt.Errorf("step1 ScaleDown: %w", err)
 	}
-	//debug.DbgCoeff("  after ScaleDown:", ctSD)
-	//debug.DbgChain("  after ScaleDown:", eval.Evaluator, ctSD)
+
+	//debug.DbgCoeff("after ScaleDown:", ctSD)
+	//debug.DbgChain("after ScaleDown:", eval.Evaluator, ctSD)
 
 	ctMU, err := eval.ModUp(ctSD)
 	if err != nil {
 		return nil, fmt.Errorf("step1 ModUp: %w", err)
 	}
-	//debug.DbgChain("  after ModUp    :", eval.Evaluator, ctMU)
+
+	//debug.DbgChain("after ModUp:", eval.Evaluator, ctMU)
 
 	ctReal, ctImag, err := eval.CoeffsToSlots(ctMU)
 	if err != nil {
@@ -58,99 +63,134 @@ func step1(eval *bootstrapping.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext
 	if ctImag == nil {
 		return nil, fmt.Errorf("step1 CoeffsToSlots returned nil ctImag (sparse CTS), recombination impossible")
 	}
-	//debug.DbgSlotStd("  after CTS real :", ctReal)
-	//debug.DbgSlotStd("  after CTS imag :", ctImag)
-	//debug.DbgChain("  after CTS      :", eval.Evaluator, ctReal)
 
-	e := eval.Evaluator
-	ib := ctImag.CopyNew()
-	if err := e.Mul(ib, complex(0, 1), ib); err != nil {
-		return nil, fmt.Errorf("step1 Mul i: %w", err)
+	//debug.DbgSlotStd("after CTS real:", ctReal)
+	//debug.DbgSlotStd("after CTS imag:", ctImag)
+	//debug.DbgChain("after CTS:", eval.Evaluator, ctReal)
+
+	ct1, err := utils.CombineReIm(eval.Evaluator, ctReal, ctImag)
+	if err != nil {
+		return nil, fmt.Errorf("step1 CombineReIm: %w", err)
 	}
 
-	ct1 := ctReal.CopyNew()
-	utils.AlignLevels(e, ct1, ib)
-	if err := e.Add(ct1, ib, ct1); err != nil {
-		return nil, fmt.Errorf("step1 Add: %w", err)
-	}
-	//debug.DbgSlotStd("  step1 out (ct1):", ct1)
-	//debug.DbgChain("  step1 out (ct1):", eval.Evaluator, ct1)
+	//debug.DbgSlotStd("step1 out (ct1):", ct1)
+	//debug.DbgChain("step1 out (ct1):", eval.Evaluator, ct1)
+
 	return ct1, nil
 }
 
-// Algo1 implements the 12 lines of Algorithm 1. Given a ciphertext packing integers
+// Run implements the 12 lines of Algorithm 1. Given a ciphertext packing integers
 // m_s in {0, ..., t-1} (t = 2^k), it returns the real and imaginary parts of the
 // t-th roots of unity exp(2*pi*i*m_s/t).
-func Algo1(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.Ciphertext, k int) (ctreal, ctimag *rlwe.Ciphertext, err error) {
-	// 1. ct1 <- CTS after ModRaise after STC(ct), recombined into one complex ct.
+func Run(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.Ciphertext, k int) (ctreal, ctimag *rlwe.Ciphertext, err error) {
+	if ctreal, ctimag, err = Extract(eval, sw, ct, k); err != nil {
+		return nil, nil, err
+	}
+	if err = Resume(eval, ctreal, ctimag); err != nil {
+		return nil, nil, err
+	}
+	return ctreal, ctimag, nil
+}
+
+// Extract runs Algorithm 1 up to and including the Re/Im extraction (extractExp): the
+// point where a packet's real part (m_A) and imaginary part (m_B) become two separate
+// ciphertexts
+func Extract(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.Ciphertext, k int) (ctreal, ctimag *rlwe.Ciphertext, err error) {
+	// 1. ct1 <- CTS after ModRaise after STC(ct), recombined into one complex ct
+
 	//fmt.Println("---- Algo1 line 1: step1 (STC, ModRaise, CTS) ----")
+
 	ct1, err := step1(eval, ct)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 1: %w", err)
 	}
-	//debug.DbgSlotStd("ct1 (Std)      :", ct1)
-	//debug.DbgChain("ct1 (Std)      :", eval.Evaluator, ct1)
 
-	// 2. ct2 <- Conv complex-to-real(ct1).
+	//debug.DbgSlotStd("ct1 (Std):", ct1)
+	//debug.DbgChain("ct1 (Std):", eval.Evaluator, ct1)
+
+	// 2. ct2 <- Conv_{Cplx->Real} (ct1)
+
 	//fmt.Println("---- Algo1 line 2: StandardToCI ----")
+
 	ct2, err := sw.StandardToCI(ct1)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 2 StandardToCI: %w", err)
 	}
-	//debug.DbgSlotCI("ct2 (CI)       :", ct2)
-	//debug.DbgChain("ct2 (CI)       :", sw.EvalCI, ct2)
+
+	//debug.DbgSlotCI("ct2 (CI):", ct2)
+	//debug.DbgChain("ct2 (CI):", sw.EvalCI, ct2)
 
 	// 3-4. ctcos <- EvalCos(ct2), ctsin <- EvalSin(ct2), at base frequency (no squarings).
+
+	//fmt.Println("---- Algo1 lines 3-4: EvalCos / EvalSin ----")
+
 	t := 1 << k
 	period := 1.0 / float64(t)
-	//fmt.Println("---- Algo1 lines 3-4: EvalCos / EvalSin ----")
+
 	ctcos, err := trigo.EvalCos(sw.CiP, sw.EvalCI, ct2, 1, period, evalExpR, evalCosDeg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 3 EvalCos: %w", err)
 	}
-	//debug.DbgSlotCI("ctcos (CI)     :", ctcos)
-	//debug.DbgChain("ctcos (CI)     :", sw.EvalCI, ctcos)
+
+	//debug.DbgSlotCI("ctcos (CI):", ctcos)
+	//debug.DbgChain("ctcos (CI):", sw.EvalCI, ctcos)
+
 	ctsin, err := trigo.EvalSin(sw.CiP, sw.EvalCI, ct2, 1, period, evalExpR, evalCosDeg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 4 EvalSin: %w", err)
 	}
-	//debug.DbgSlotCI("ctsin (CI)     :", ctsin)
-	//debug.DbgChain("ctsin (CI)     :", sw.EvalCI, ctsin)
 
-	// 5-6. Back to the complex (standard) context.
+	//debug.DbgSlotCI("ctsin (CI):", ctsin)
+	//debug.DbgChain("ctsin (CI):", sw.EvalCI, ctsin)
+
+	// 5-6. Back to the complex (std) context
+
 	//fmt.Println("---- Algo1 lines 5-6: CIToStandard ----")
+
 	ctcosC, err := sw.CIToStandard(ctcos)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 5 CIToStandard cos: %w", err)
 	}
-	//debug.DbgSlotStd("ctcosC (Std)   :", ctcosC)
-	//debug.DbgChain("ctcosC (Std)   :", eval.Evaluator, ctcosC)
+
+	//debug.DbgSlotStd("ctcosC (Std):", ctcosC)
+	//debug.DbgChain("ctcosC (Std):", eval.Evaluator, ctcosC)
+
 	ctsinC, err := sw.CIToStandard(ctsin)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 6 CIToStandard sin: %w", err)
 	}
-	//debug.DbgSlotStd("ctsinC (Std)   :", ctsinC)
-	//debug.DbgChain("ctsinC (Std)   :", eval.Evaluator, ctsinC)
 
-	// 7-12. Re/Im extraction and recombination (extractExp is exactly these 6 lines).
+	//debug.DbgSlotStd("ctsinC (Std):", ctsinC)
+	//debug.DbgChain("ctsinC (Std):", eval.Evaluator, ctsinC)
+
+	// 7-12. Re/Im extraction (base frequency). ---- Algo1 pauses here in the refresh. ----
+
 	//fmt.Println("---- Algo1 lines 7-12: extractExp ----")
+
 	ctreal, ctimag, err = extractExp(eval.Evaluator, ctcosC, ctsinC)
 	if err != nil {
 		return nil, nil, fmt.Errorf("lines 7-12 extractExp: %w", err)
 	}
-	//debug.DbgSlotStd("ctreal (Std)   :", ctreal)
-	//debug.DbgSlotStd("ctimag (Std)   :", ctimag)
-	//debug.DbgChain("ctreal (Std)   :", eval.Evaluator, ctreal)
 
-	// Target frequency reached by r double-angle squarings (x2^r on the angle).
-	//fmt.Println("---- Algo1 squareExp ----")
-	if err = squareExp(eval.Evaluator, ctreal, ctimag, evalExpR); err != nil {
-		return nil, nil, fmt.Errorf("squareExp: %w", err)
-	}
-	//debug.DbgSlotStd("ctreal sq (Std):", ctreal)
-	//debug.DbgSlotStd("ctimag sq (Std):", ctimag)
-	//debug.DbgChain("ctreal sq (Std):", eval.Evaluator, ctreal)
+	//debug.DbgSlotStd("ctreal (Std):", ctreal)
+	//debug.DbgSlotStd("ctimag (Std):", ctimag)
+	//debug.DbgChain("ctreal/ctimag chain (Std):", eval.Evaluator, ctreal)
+
 	return ctreal, ctimag, nil
+}
+
+// Resume finishes Algorithm 1 after the pause: the evalExpR double-angle squarings that
+// bring the extracted Re/Im parts from the base frequency to the target t-th roots of unity.
+func Resume(eval *bootstrapping.Evaluator, ctreal, ctimag *rlwe.Ciphertext) error {
+	if err := squareExp(eval.Evaluator, ctreal, ctimag, evalExpR); err != nil {
+		return fmt.Errorf("squareExp: %w", err)
+	}
+
+	//debug.DbgSlotStd("ctreal squarred (Std):", ctreal)
+	//debug.DbgSlotStd("ctimag squarred (Std):", ctimag)
+	//debug.DbgChain("ctreal squarred (Std):", eval.Evaluator, ctreal)
+
+	return nil
 }
 
 // extractExp splits cos and sin into
@@ -218,21 +258,26 @@ func extractExp(e *ckks.Evaluator, ctCosC, ctSinC *rlwe.Ciphertext) (ctReal, ctI
 	return ctReal, ctImag, nil
 }
 
+// square applies one double-angle squaring in place (MulRelin then Rescale).
+func square(e *ckks.Evaluator, ct *rlwe.Ciphertext) error {
+	if err := e.MulRelin(ct, ct, ct); err != nil {
+		return fmt.Errorf("MulRelin: %w", err)
+	}
+	if err := e.Rescale(ct, ct); err != nil {
+		return fmt.Errorf("Rescale: %w", err)
+	}
+	return nil
+}
+
 // squareExp applies r double-angle squarings to the real and imaginary parts,
 // each squared independently (MulRelin then Rescale), to reach the target frequency.
 func squareExp(e *ckks.Evaluator, ctreal, ctimag *rlwe.Ciphertext, r int) error {
 	for i := 0; i < r; i++ {
-		if err := e.MulRelin(ctreal, ctreal, ctreal); err != nil {
+		if err := square(e, ctreal); err != nil {
 			return fmt.Errorf("squaring %d ctreal: %w", i+1, err)
 		}
-		if err := e.Rescale(ctreal, ctreal); err != nil {
-			return fmt.Errorf("rescale squaring %d ctreal: %w", i+1, err)
-		}
-		if err := e.MulRelin(ctimag, ctimag, ctimag); err != nil {
+		if err := square(e, ctimag); err != nil {
 			return fmt.Errorf("squaring %d ctimag: %w", i+1, err)
-		}
-		if err := e.Rescale(ctimag, ctimag); err != nil {
-			return fmt.Errorf("rescale squaring %d ctimag: %w", i+1, err)
 		}
 	}
 	return nil

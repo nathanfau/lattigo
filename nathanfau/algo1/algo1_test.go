@@ -17,6 +17,7 @@ import (
 	"github.com/tuneinsight/lattigo/v6/nathanfau/cleaning"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/convctx"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/debug"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
@@ -35,7 +36,7 @@ func newAlgo1Context(t *testing.T, k int) (ckks.Parameters, *ckks.Encoder, *rlwe
 	logQ = append(logQ, 38, 38, 38)         // 3 levels for squarring
 	logQ = append(logQ, 38)                 // etractExp
 	logQ = append(logQ, 38)                 // second Conv_{Real->Cplx}
-	logQ = append(logQ, 38, 38, 38, 38, 38) // EvalCos		(38*7 in the article)
+	logQ = append(logQ, 38, 38, 38, 38, 38) // EvalCos
 	logQ = append(logQ, 38)                 // first Conv_{Cplx->Real}
 	logQ = append(logQ, 38, 38, 38)         // CoeffToSlots
 
@@ -102,6 +103,7 @@ func newAlgo1Context(t *testing.T, k int) (ckks.Parameters, *ckks.Encoder, *rlwe
 		EphemeralSecretWeight:   32,
 		CircuitOrder:            bootstrapping.DecodeThenModUp,
 	}
+	debug.DbgParams("algo1", params)
 
 	sk := rlwe.NewKeyGenerator(params).GenSecretKeyNew()
 	evk, _, err := btpParams.GenEvaluationKeys(sk)
@@ -128,11 +130,10 @@ func newAlgo1Context(t *testing.T, k int) (ckks.Parameters, *ckks.Encoder, *rlwe
 	return params, ecd, enc, dec, eval, sw
 }
 
-// TestAlgo1 runs the bootstrap end to end (no transciphering, no AES). It encrypts k
-// bit-planes of two independent streams packed as the real and imaginary parts, packs them into
-// one integer per stream with BitPack, bootstraps with Algo1 (which returns the t-th roots of
-// unity of each stream), extracts the bits back with BitExtract, cleans them, and checks that
-// every recovered bit matches the original plane.
+// TestAlgo1 runs the bootstrap end to end. It encrypts k bit-planes of two independent streams
+// packed as the real and imaginary parts, packs them into one integer per stream with BitPack,
+// bootstraps with Algo1 (which returns the t-th roots of unity of each stream), extracts the bits
+// back with BitExtract, cleans them, and checks that every recovered bit matches the original plane.
 func TestAlgo1(t *testing.T) {
 	const k = 4
 	params, ecd, enc, dec, eval, sw := newAlgo1Context(t, k)
@@ -166,7 +167,7 @@ func TestAlgo1(t *testing.T) {
 		have[j] = ct
 	}
 
-	fmt.Println("================ input bit-planes ================")
+	fmt.Println("----input bit-planes----")
 	for j := 0; j < k; j++ {
 		debug.DbgSlotStd(fmt.Sprintf("have[%d] =", j), have[j])
 		debug.DbgChain("chain have :", eval.Evaluator, have[j])
@@ -182,7 +183,7 @@ func TestAlgo1(t *testing.T) {
 		t.Fatalf("expected 1 group, got %d", len(groups))
 	}
 	ctPack := groups[0]
-	fmt.Println("================ BitPack ================")
+	fmt.Println("---- BitPack ----")
 	debug.DbgSlotStd("ctPack =", ctPack)
 	debug.DbgChain("chain ctPack :", eval.Evaluator, ctPack)
 
@@ -200,10 +201,10 @@ func TestAlgo1(t *testing.T) {
 	}
 
 	// Algo1 = the bootstrap.
-	fmt.Println("================ Algo1 (bootstrap) ================")
-	ctReal, ctImag, err := Algo1(eval, sw, ctPack, k)
+	fmt.Println("---- Algo1 (bootstrap) ----")
+	ctReal, ctImag, err := Run(eval, sw, ctPack, k)
 	if err != nil {
-		t.Fatalf("Algo1: %v", err)
+		t.Fatalf("Run: %v", err)
 	}
 	debug.DbgSlotStd("ctReal =", ctReal)
 	debug.DbgChain("chain ctReal :", eval.Evaluator, ctReal)
@@ -221,7 +222,7 @@ func TestAlgo1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BitExtract imag: %v", err)
 	}
-	fmt.Println("================ BitExtract (raw) ================")
+	fmt.Println("---- BitExtract  ----")
 	for j := 0; j < k; j++ {
 		debug.DbgSlotStd(fmt.Sprintf("bitsReExtrated[%d] raw =", j), bitsReExtrated[j])
 		debug.DbgChain("chain bitsReExtrated raw :", eval.Evaluator, bitsReExtrated[j])
@@ -240,7 +241,7 @@ func TestAlgo1(t *testing.T) {
 			t.Fatalf("Cleaning imag bit %d: %v", j, err)
 		}
 	}
-	fmt.Println("================ Cleaning ================")
+	fmt.Println("---- Cleaning ----")
 	for j := 0; j < k; j++ {
 		debug.DbgSlotStd(fmt.Sprintf("bitsReExtrated[%d] cleaned =", j), bitsReExtrated[j])
 		debug.DbgChain("chain bitsReExtrated cleaned :", eval.Evaluator, bitsReExtrated[j])
@@ -251,27 +252,23 @@ func TestAlgo1(t *testing.T) {
 	}
 
 	// Check every recovered bit against the original plane.
-	checkBits(t, ecd, dec, bitsReExtrated, bitsRe, "real")
-	checkBits(t, ecd, dec, bitsImExtrated, bitsIm, "imag")
-}
-
-// checkBits decodes each extracted bit ciphertext and checks it against the original plane
-func checkBits(t *testing.T, ecd *ckks.Encoder, dec *rlwe.Decryptor, got []*rlwe.Ciphertext, want [][]float64, name string) {
-	t.Helper()
-	for j := range got {
-		dcd := make([]complex128, got[j].Slots())
-		if err := ecd.Decode(dec.DecryptNew(got[j]), dcd); err != nil {
-			t.Fatalf("%s decode bit %d: %v", name, j, err)
+	check := func(name string, got []*rlwe.Ciphertext, want [][]float64) {
+		res, err := utils.BitDistance(ecd, dec, got, want, math.Exp2(-minBitPrec))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
 		}
-		wrong := 0
-		for s := range want[j] {
-			if (real(dcd[s]) >= 0.5) != (want[j][s] >= 0.5) {
-				wrong++
+		for j, r := range res {
+			msg := fmt.Sprintf("%s bit %d: worst |err| = 2^%.1f, %d/%d slots over 2^%.0f",
+				name, j, math.Log2(r.Worst), r.Wrong, r.Slots, math.Log2(r.Tol))
+			t.Log(msg)
+			if r.Wrong != 0 {
+				t.Error(msg)
 			}
 		}
-		t.Logf("%s bit %d: %d/%d wrong", name, j, wrong, len(want[j]))
-		if wrong != 0 {
-			t.Errorf("%s bit %d: %d bits wrong", name, j, wrong)
-		}
 	}
+	check("real", bitsReExtrated, bitsRe)
+	check("imag", bitsImExtrated, bitsIm)
 }
+
+// minBitPrec is the precision a recovered bit must reach: |got - bit| <= 2^-minBitPrec.
+const minBitPrec = 20.0
