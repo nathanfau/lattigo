@@ -92,6 +92,32 @@ func MixColumns(s []byte) {
 	}
 }
 
+// Row-major round functions. The blockpack layout numbers the state ROW-major (byte 4r+c) instead
+// of the FIPS-197 column-major order above, so these are the cleartext oracle the HE round
+// functions must be compared against.
+
+// ShiftRowsRM applies ShiftRows to a row-major state: row r rotates left by r.
+func ShiftRowsRM(s [16]byte) (o [16]byte) {
+	for r := 0; r < 4; r++ {
+		for c := 0; c < 4; c++ {
+			o[4*r+c] = s[4*r+(c+r)%4]
+		}
+	}
+	return o
+}
+
+// MixColumnsRM applies MixColumns to the columns of a row-major state, i.e. to the positions
+// {c, c+4, c+8, c+12}.
+func MixColumnsRM(s [16]byte) (o [16]byte) {
+	for c := 0; c < 4; c++ {
+		var col [16]byte
+		col[0], col[1], col[2], col[3] = s[c], s[c+4], s[c+8], s[c+12]
+		MixColumns(col[:])
+		o[c], o[c+4], o[c+8], o[c+12] = col[0], col[1], col[2], col[3]
+	}
+	return o
+}
+
 // Decryption round functions.
 
 func InvSubBytes(s []byte) {
