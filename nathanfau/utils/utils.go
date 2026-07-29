@@ -8,52 +8,6 @@ import (
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
 
-// ============================================================================================
-// QUICK REFERENCE
-//
-//   value? = what happens to the DECODED value
-//     Y        preserved EXACTLY - DropLevel only (RNS limb truncation), adds no error
-//     ~Y       preserved ALMOST exactly - a Rescale is involved, so its rounding noise is added
-//     ~Y(bit)  ~Y but ONLY for p in {0,1} (p^2 = p); amplifies error near s=1, wrong otherwise
-//     product  the func's job is to output x*y
-//     combine  the func's job is to output a + i*b
-//
-//   scale? = what happens to the SCALE metadata
-//     chain    stays on the canonical 2^Delta chain -> Add/Sub/Mul with other chain
-//              ciphertexts is exact with NO manual scale matching
-//     chain=   on the chain AND all outputs land on the SAME scale (ready to Add/Sub)
-//     kept     original scale kept, may sit OFF the chain, so YOU must match it
-//              (ForceScale) before combining with a chain ciphertext
-//     Delta^2  degree-2 product scale (~Delta^2), not yet rescaled
-//     set      forced to a scale target
-//
-//   level? = levels consumed by the call.
-//
-// 	 ops = relin + rescale actually performed.
-//
-//   func                  | value?  | scale?  | level?              					| ops (relin+resc)
-//   ----------------------+---------+---------+----------------------------------------+-----------------
-//   ForceScale(ct,s)      | ~Y      | set     | -1  (0 if already scaled at given s)	| 0+1
-//   AlignLevels(a,b)      | Y       | kept    | min(a,b)       						| 0+0
-//   FlattenLevels(cts)    | Y       | kept    | min(all)         						| 0+0
-//   CombineReIm(a,b)      | combine | kept(a) | 0 (a and b are already align)			| 0+0
-//   ----------------------+---------+---------+----------------------------------------+-----------------
-//   SquareBit(ct)         | ~Y(bit) | chain   | -1                  					| 1+1
-//   DescendBit(ct,l)      | ~Y(bit) | chain   | current_level - l = k 					| k*(1+1)
-//   AlignBitLevels(a,b)   | ~Y(bit) | chain=  | min(a,b) = k   	    				| k*(1+1)
-//   FlattenBitLevels(cts) | ~Y(bit) | chain=  | min(all) = k  	    					| k*(1+1)
-//   ----------------------+---------+---------+----------------------------------------+-------------------
-//   MulBits(x,y)          | product | chain   | -1 (+align squares) 					| 1+1 (+k*(1+1))
-//   MulLeveled(a,b)       | product | kept    | -1                  					| 1+1
-//   MulLeveledLazy(a,b)   | product | Delta^2 | 0  (output is deg-2)  					| 0+0
-//
-// Rule of thumb: a bit-sliced boolean circuit (homomorphic AES) uses the "chain" column
-// (SquareBit / ... / MulBits) so every gate keeps scale = f(level) and Add/Sub need no
-// fixups.
-// Use the "kept" column (AlignLevels / MulLeveled / ...) when YOU manage scales
-// yourself (RescaleTo / ForceScale to a fixed target).
-// ============================================================================================
-
 // OpCounter counts the expensive CKKS operations, used when designing differents SubByts versions.
 type OpCounter struct {
 	Relin   int
@@ -95,85 +49,9 @@ func CombineReIm(eval *ckks.Evaluator, a, b *rlwe.Ciphertext) (*rlwe.Ciphertext,
 	return out, nil
 }
 
-// SquareBit computes ct <- ct^2 (MulRelin + Rescale), descending one level. For a bit p in
-// {0,1}, p^2 = p, so the value is preserved while the scale follows the prime chain.
-func SquareBit(eval *ckks.Evaluator, ct *rlwe.Ciphertext) error {
-	if err := eval.MulRelin(ct, ct, ct); err != nil {
-		return fmt.Errorf("SquareBit MulRelin: %w", err)
-	}
-	Ops.Relin++
-	if err := eval.Rescale(ct, ct); err != nil {
-		return fmt.Errorf("SquareBit Rescale: %w", err)
-	}
-	Ops.Rescale++
-	return nil
-}
-
-// DescendBit lowers a bit ciphertext to level 'lvl' by repeated squaring (see SquareBit).
-func DescendBit(eval *ckks.Evaluator, ct *rlwe.Ciphertext, lvl int) error {
-	for ct.Level() > lvl {
-		if err := SquareBit(eval, ct); err != nil {
-			return fmt.Errorf("DescendBit: %w", err)
-		}
-	}
-	return nil
-}
-
-// AlignBitLevels lowers whichever of the two bit ciphertexts is higher to the other's level
-// by squaring. Unlike AlignLevels (DropLevel), the descended ciphertext keeps the canonical
-// scale of its new level, so a and b end up at the same level AND the same scale.
-func AlignBitLevels(eval *ckks.Evaluator, a, b *rlwe.Ciphertext) error {
-	if a.Level() > b.Level() {
-		return DescendBit(eval, a, b.Level())
-	}
-	if b.Level() > a.Level() {
-		return DescendBit(eval, b, a.Level())
-	}
-	return nil
-}
-
-// FlattenBitLevels brings all bit ciphertexts to their common minimum level by squaring.
-func FlattenBitLevels(eval *ckks.Evaluator, cts []*rlwe.Ciphertext) error {
-	min := 1 << 30
-	for _, ct := range cts {
-		if l := ct.Level(); l < min {
-			min = l
-		}
-	}
-	for _, ct := range cts {
-		if err := DescendBit(eval, ct, min); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// MulBits multiplies two bit ciphertexts, first aligning their levels by squaring (never
-// DropLevel) so the product stays on the canonical scale chain, then MulRelin + Rescale.
-//
-// Lattigo's Mul already handles operands at different levels, but it descends the higher one
-// by truncation (keeping its scale), which takes the product off the canonical scale chain
-// and breaks later Add/Sub; squaring the higher operand (value-safe for a bit) avoids that.
-func MulBits(eval *ckks.Evaluator, x, y *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
-	p := x.CopyNew()
-	q := y.CopyNew()
-	if err := AlignBitLevels(eval, p, q); err != nil {
-		return nil, fmt.Errorf("MulBits align: %w", err)
-	}
-	if err := eval.MulRelin(p, q, p); err != nil {
-		return nil, fmt.Errorf("MulBits MulRelin: %w", err)
-	}
-	Ops.Relin++
-	if err := eval.Rescale(p, p); err != nil {
-		return nil, fmt.Errorf("MulBits Rescale: %w", err)
-	}
-	Ops.Rescale++
-	return p, nil
-}
-
-// MulLeveled multiplies two ciphertexts the standard LEVELED way, WITHOUT squaring: the higher
-// operand is brought to the lower operand's level by AlignLevels (DropLevel= no relin, no
-// rescale, value-preserving), then a single MulRelin + Rescale.
+// MulLeveled multiplies two ciphertexts the standard LEVELED way: the higher operand is brought
+// to the lower operand's level by AlignLevels (DropLevel = no relin, no rescale, value-preserving),
+// then a single MulRelin + Rescale.
 func MulLeveled(eval *ckks.Evaluator, a, b *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
 	p := a.CopyNew()
 	q := b.CopyNew()
@@ -200,6 +78,32 @@ func MulLeveledLazy(eval *ckks.Evaluator, a, b *rlwe.Ciphertext) (*rlwe.Cipherte
 		return nil, fmt.Errorf("MulLeveledLazy Mul: %w", err)
 	}
 	return out, nil
+}
+
+// ReduceBalanced folds a list into a single element with a BALANCED tree, i.e. depth
+// ceil(log2 n) instead of the n-1 of a left fold, which is what keeps the XOR trees shallow.
+func ReduceBalanced[T any](items []T, combine func(T, T) (T, error)) (T, error) {
+	var zero T
+	if len(items) == 0 {
+		return zero, fmt.Errorf("ReduceBalanced: empty list")
+	}
+	cur := make([]T, len(items))
+	copy(cur, items)
+	for len(cur) > 1 {
+		var next []T
+		for i := 0; i+1 < len(cur); i += 2 {
+			x, err := combine(cur[i], cur[i+1])
+			if err != nil {
+				return zero, err
+			}
+			next = append(next, x)
+		}
+		if len(cur)%2 == 1 {
+			next = append(next, cur[len(cur)-1])
+		}
+		cur = next
+	}
+	return cur[0], nil
 }
 
 // FlattenLevels brings all ciphertexts to their common minimum level using DropLevel only (no
