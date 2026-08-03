@@ -1,8 +1,6 @@
-// All the homomorphic S-box (SubByte) variants and their helpers are in this file.
-// It is purely an organizational split from aes_he.go
-//
-// The three variants (V2, V3, V4) share one implementation, subByte, and differ ONLY by how
-// aggressively they defer the relin + rescale of the built ANF monomials.
+// The homomorphic S-box (SubByte) and its ANF machinery. The three variants V1, V2 and V3 share
+// one implementation, subByte, and differ ONLY by how aggressively they defer the relin + rescale
+// of the built ANF monomials
 package aes
 
 import (
@@ -115,14 +113,10 @@ func factorMonomials(needed []int) map[int]bool {
 	return factors
 }
 
-// lazyFn reports whether a monomial mask is kept LAZY, i.e. left as a degree-2 product at scale
-// ~Delta^2 (utils.MulLeveledLazy: no relin, no rescale) instead of being reduced back to degree 1
-// at build time (utils.MulLeveled).
+// lazyFn reports whether a monomial mask is kept LAZY
 type lazyFn func(S int) bool
 
-// lazyAbove builds the laziness predicate of a variant: a monomial is lazy when it is a LEAF (not
-// reused as a build factor, so nothing multiplies it again) and its degree is >= minDeg.
-// minDeg = 0 disables laziness entirely.
+// lazyAbove builds the laziness predicate of a variant: a monomial is lazy when it is a LEAF
 func (s *sboxANF) lazyAbove(minDeg int) lazyFn {
 	return func(S int) bool {
 		return minDeg > 0 && !s.factors[S] && bits.OnesCount(uint(S)) >= minDeg
@@ -279,29 +273,18 @@ func (a *Evaluator) subByte(inp ByteHE, lazyMinDeg int) (ByteHE, error) {
 	return a.sboxSum(mono, s, isLazy)
 }
 
-// SubByteV2 is the non-lazy [BCKK25] baseline: every monomial is relinearized + rescaled at build
+// The three variants, ordered by decreasing cost: 247, 98, 69 relin per byte.
+
+// SubByteV1 is the non-lazy [BCKK25] baseline: every monomial is relinearized + rescaled at build
 // time. Cost: one relin + one rescale per monomial of degree >= 2, i.e. 247 = 255 - 8 per byte.
-func (a *Evaluator) SubByteV2(inp ByteHE) (ByteHE, error) { return a.subByte(inp, 0) }
+func (a *Evaluator) SubByteV1(inp ByteHE) (ByteHE, error) { return a.subByte(inp, 0) }
+
+// SubByteV2 keeps lazy only the leaf monomials of degree >= 4; the factors and the degree-2/3
+// leaves are relinearized + rescaled at build time. Cost: 61 factors + 29 low-degree leaves + 8
+// accumulators = 98 relin and 98 rescale per byte.
+func (a *Evaluator) SubByteV2(inp ByteHE) (ByteHE, error) { return a.subByte(inp, 4) }
 
 // SubByteV3 is fully lazy: only the 61 monomials reused as a build factor are relinearized +
 // rescaled, the 186 leaf monomials stay degree-2 at scale ~Delta^2 and their relin + rescale is
 // deferred to one pair per output-bit accumulator. Cost: 61 + 8 = 69 relin and 69 rescale per byte.
 func (a *Evaluator) SubByteV3(inp ByteHE) (ByteHE, error) { return a.subByte(inp, 2) }
-
-// SubByteV4 is a less aggressive lazy strategy than SubByteV3: only the leaf monomials of degree
-// >= 4 are kept lazy, the factors and the degree-2/3 leaves are relinearized + rescaled at build
-// time. Cost: 61 factors + 29 low-degree leaves + 8 accumulators = 98 relin and 98 rescale per byte.
-func (a *Evaluator) SubByteV4(inp ByteHE) (ByteHE, error) { return a.subByte(inp, 4) }
-
-func (a *Evaluator) SubByte(inp ByteHE, version int) (ByteHE, error) {
-	switch version {
-	case 2:
-		return a.SubByteV2(inp)
-	case 3:
-		return a.SubByteV3(inp)
-	case 4:
-		return a.SubByteV4(inp)
-	default:
-		return ByteHE{}, fmt.Errorf("SubByte: unknown version %d (want 2..4)", version)
-	}
-}

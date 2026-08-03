@@ -1,11 +1,13 @@
+// The homomorphic side of the package: the evaluator every round function hangs off, and the
+// selectors that tie the circuits together. One file per round function next to this one --
+// sbox_he.go, shiftrows_he.go, mixcolumns_he.go, xor_he.go -- and aes.go for the cleartext AES the
+// tests check against.
 package aes
 
 import (
 	"fmt"
-	"sort"
 
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
-	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
 
@@ -21,126 +23,63 @@ func NewEvaluator(eval *ckks.Evaluator) *Evaluator {
 	return &Evaluator{eval: eval}
 }
 
-// Xor computes x XOR y = (x - y)^2 between bits (ciphertexts in {0,1})
-func (a *Evaluator) Xor(x, y *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
-	xx := x.CopyNew()
-	yy := y.CopyNew()
+// XorFunc is a two-ciphertext XOR circuit: XorSq and XorNoSq both fit.
+type XorFunc func(x, y *rlwe.Ciphertext) (*rlwe.Ciphertext, error)
 
-	utils.AlignLevels(a.eval, xx, yy)
-	if err := a.eval.Sub(xx, yy, xx); err != nil { // x - y
-		return nil, fmt.Errorf("xor x-y: %w", err)
-	}
-	if err := a.eval.MulRelin(xx, xx, xx); err != nil { // (x - y)^2
-		return nil, fmt.Errorf("xor square: %w", err)
-	}
-	if err := a.eval.Rescale(xx, xx); err != nil {
-		return nil, fmt.Errorf("xor rescale: %w", err)
-	}
-	return xx, nil
-}
+// XorPlainFunc is the same against a cleartext bit plane: XorSqPlain and XorNoSqPlain both fit.
+type XorPlainFunc func(x *rlwe.Ciphertext, bits []float64) (*rlwe.Ciphertext, error)
 
-type mcLeaf struct{ off, bit int }
+// XorKind names a circuit, so one value picks both flavours at once.
+type XorKind int
 
-// mixColLeaves generates, for each output D_d and each bit j, the reduced-parity (sorted for
-// reproducibility) list of input leaves. In encryption form:
-//
-//	D_d = xtime(b_p ^ b_q) ^ b_e0 ^ b_e1 ^ b_e2
-//
-// only kept for reproducibility.
-func mixColLeaves() [4][8][]mcLeaf {
-	xmap := [8][]int{{7}, {0, 7}, {1}, {2, 7}, {3, 7}, {4}, {5}, {6}}
-	type ddef struct {
-		p, q   int
-		extras [3]int
-	}
-	dd := [4]ddef{
-		{0, 1, [3]int{1, 2, 3}},
-		{1, 2, [3]int{2, 3, 0}},
-		{2, 3, [3]int{3, 0, 1}},
-		{3, 0, [3]int{0, 1, 2}},
-	}
-	var res [4][8][]mcLeaf
-	for d := 0; d < 4; d++ {
-		for j := 0; j < 8; j++ {
-			cnt := map[mcLeaf]int{}
-			for _, k := range xmap[j] {
-				cnt[mcLeaf{dd[d].p, k}]++
-				cnt[mcLeaf{dd[d].q, k}]++
-			}
-			for _, m := range dd[d].extras {
-				cnt[mcLeaf{m, j}]++
-			}
-			for lf, c := range cnt {
-				if c%2 == 1 {
-					res[d][j] = append(res[d][j], lf)
-				}
-			}
-			sort.Slice(res[d][j], func(x, y int) bool {
-				a, b := res[d][j][x], res[d][j][y]
-				if a.off != b.off {
-					return a.off < b.off
-				}
-				return a.bit < b.bit
-			})
-		}
-	}
-	return res
-}
-
-// mcLeavesTable is the hard-coded output of mixColLeaves
-var mcLeavesTable = [4][8][]mcLeaf{
-	{{{0, 7}, {1, 0}, {1, 7}, {2, 0}, {3, 0}}, {{0, 0}, {0, 7}, {1, 0}, {1, 1}, {1, 7}, {2, 1}, {3, 1}}, {{0, 1}, {1, 1}, {1, 2}, {2, 2}, {3, 2}}, {{0, 2}, {0, 7}, {1, 2}, {1, 3}, {1, 7}, {2, 3}, {3, 3}}, {{0, 3}, {0, 7}, {1, 3}, {1, 4}, {1, 7}, {2, 4}, {3, 4}}, {{0, 4}, {1, 4}, {1, 5}, {2, 5}, {3, 5}}, {{0, 5}, {1, 5}, {1, 6}, {2, 6}, {3, 6}}, {{0, 6}, {1, 6}, {1, 7}, {2, 7}, {3, 7}}}, // D0
-	{{{0, 0}, {1, 7}, {2, 0}, {2, 7}, {3, 0}}, {{0, 1}, {1, 0}, {1, 7}, {2, 0}, {2, 1}, {2, 7}, {3, 1}}, {{0, 2}, {1, 1}, {2, 1}, {2, 2}, {3, 2}}, {{0, 3}, {1, 2}, {1, 7}, {2, 2}, {2, 3}, {2, 7}, {3, 3}}, {{0, 4}, {1, 3}, {1, 7}, {2, 3}, {2, 4}, {2, 7}, {3, 4}}, {{0, 5}, {1, 4}, {2, 4}, {2, 5}, {3, 5}}, {{0, 6}, {1, 5}, {2, 5}, {2, 6}, {3, 6}}, {{0, 7}, {1, 6}, {2, 6}, {2, 7}, {3, 7}}}, // D1
-	{{{0, 0}, {1, 0}, {2, 7}, {3, 0}, {3, 7}}, {{0, 1}, {1, 1}, {2, 0}, {2, 7}, {3, 0}, {3, 1}, {3, 7}}, {{0, 2}, {1, 2}, {2, 1}, {3, 1}, {3, 2}}, {{0, 3}, {1, 3}, {2, 2}, {2, 7}, {3, 2}, {3, 3}, {3, 7}}, {{0, 4}, {1, 4}, {2, 3}, {2, 7}, {3, 3}, {3, 4}, {3, 7}}, {{0, 5}, {1, 5}, {2, 4}, {3, 4}, {3, 5}}, {{0, 6}, {1, 6}, {2, 5}, {3, 5}, {3, 6}}, {{0, 7}, {1, 7}, {2, 6}, {3, 6}, {3, 7}}}, // D2
-	{{{0, 0}, {0, 7}, {1, 0}, {2, 0}, {3, 7}}, {{0, 0}, {0, 1}, {0, 7}, {1, 1}, {2, 1}, {3, 0}, {3, 7}}, {{0, 1}, {0, 2}, {1, 2}, {2, 2}, {3, 1}}, {{0, 2}, {0, 3}, {0, 7}, {1, 3}, {2, 3}, {3, 2}, {3, 7}}, {{0, 3}, {0, 4}, {0, 7}, {1, 4}, {2, 4}, {3, 3}, {3, 7}}, {{0, 4}, {0, 5}, {1, 5}, {2, 5}, {3, 4}}, {{0, 5}, {0, 6}, {1, 6}, {2, 6}, {3, 5}}, {{0, 6}, {0, 7}, {1, 7}, {2, 7}, {3, 6}}}, // D3
-}
-
-// xorTree XORs a list of ciphertexts via a balanced tree.
-func (a *Evaluator) xorTree(cts []*rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
-	return utils.ReduceBalanced(cts, a.Xor)
-}
-
-var (
-	shiftRowsSrc  = [8]int{0, 5, 2, 7, 4, 1, 6, 3}
-	shiftRowsSwap = [8]bool{false, false, true, true, false, true, true, false}
+const (
+	NoSq XorKind = iota // x+y-2xy, the pipeline default and the zero value
+	Sq                  // (x-y)^2
 )
 
-// ShiftRows applies AES ShiftRows at the Algo1 pause
-func (a *Evaluator) ShiftRows(reals, imags [16]*rlwe.Ciphertext) (re, im [16]*rlwe.Ciphertext) {
-	for j := 0; j < 8; j++ {
-		g := shiftRowsSrc[j]
-		if shiftRowsSwap[j] {
-			re[2*j], re[2*j+1] = imags[2*g], imags[2*g+1]
-			im[2*j], im[2*j+1] = reals[2*g], reals[2*g+1]
-		} else {
-			re[2*j], re[2*j+1] = reals[2*g], reals[2*g+1]
-			im[2*j], im[2*j+1] = imags[2*g], imags[2*g+1]
-		}
+func (k XorKind) String() string {
+	if k == Sq {
+		return "sq ((x-y)^2)"
 	}
-	return re, im
+	return "nosq (x+y-2xy)"
 }
 
-// MixColumns applies AES MixColumns to a blockpack's way packed group of ct
-func (a *Evaluator) MixColumns(p [8]ByteHE) ([8]ByteHE, error) {
-	var out [8]ByteHE
-	for quad := 0; quad < 2; quad++ {
-		base := 4 * quad
-		for d := 0; d < 4; d++ {
-			var ob ByteHE
-			for j := 0; j < 8; j++ {
-				leaves := mcLeavesTable[d][j]
-				cts := make([]*rlwe.Ciphertext, len(leaves))
-				for n, lf := range leaves {
-					cts[n] = p[base+lf.off][lf.bit]
-				}
-				r, err := a.xorTree(cts)
-				if err != nil {
-					return out, fmt.Errorf("MixColumns quad %d D%d bit %d: %w", quad, d, j, err)
-				}
-				ob[j] = r
-			}
-			out[base+d] = ob
-		}
+// ParseXorKind reads the name a flag carries.
+func ParseXorKind(s string) (XorKind, error) {
+	switch s {
+	case "sq", "square":
+		return Sq, nil
+	case "nosq", "arith":
+		return NoSq, nil
 	}
-	return out, nil
+	return 0, fmt.Errorf("unknown XOR %q, want \"sq\" or \"nosq\"", s)
+}
+
+// Of and PlainOf return the XOR circuits of the given kind.
+func (a *Evaluator) Of(k XorKind) XorFunc {
+	if k == Sq {
+		return a.XorSq
+	}
+	return a.XorNoSq
+}
+
+func (a *Evaluator) PlainOf(k XorKind) XorPlainFunc {
+	if k == Sq {
+		return a.XorSqPlain
+	}
+	return a.XorNoSqPlain
+}
+
+// SubByte applies the S-box variant named by version (1..3), cheapest circuit last.
+func (a *Evaluator) SubByte(inp ByteHE, version int) (ByteHE, error) {
+	switch version {
+	case 1:
+		return a.SubByteV1(inp)
+	case 2:
+		return a.SubByteV2(inp)
+	case 3:
+		return a.SubByteV3(inp)
+	default:
+		return ByteHE{}, fmt.Errorf("SubByte: unknown version %d (want 1..3)", version)
+	}
 }
