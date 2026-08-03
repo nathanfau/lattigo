@@ -58,3 +58,13 @@ _testmain.go
 nathanfau/_freexor/
 nathanfau/_old/
 nathanfau/_scale33/
+
+# sorties -v des runs de test, le sweep et le tee qui les produisent.
+# logging_test.go déclare le TestMain du paquet transciphering, il ne peut donc pas vivre
+# dans logs/ : il est ignoré sur place.
+nathanfau/logs/
+nathanfau/transciphering/logging_test.go
+
+# expérimentations locales
+nathanfau/transciphering/q37_test.go
+nathanfau/transciphering/cleanearly_test.go

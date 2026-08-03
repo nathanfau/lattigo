@@ -98,7 +98,12 @@ func printPrec(label string, want any, ct *rlwe.Ciphertext, params ckks.Paramete
 	prec := ckks.GetPrecisionStats(params, ecd, dec, want, ct, 0, false)
 	table := prec.String()
 	if realOnly {
-		table = precStringReal(prec)
+		st, err := utils.BitDistanceCt(ecd, dec, ct, want, 0)
+		if err != nil {
+			fmt.Printf(" %s : %v\n", label, err)
+			return
+		}
+		table = precStringReal(prec, -math.Log2(st.Best))
 	}
 	fmt.Printf(" %s \n%s", label, table)
 }
@@ -122,15 +127,23 @@ func PrintPrecCI(label string, want interface{}, ct *rlwe.Ciphertext) {
 	printPrec(label, want, ct, ParamsCI, EncCI, DecCI, true)
 }
 
-// precStringReal formats a PrecisionStats table with the REAL column only.
-func precStringReal(p ckks.PrecisionStats) string {
-	f := func(v float64) string { return fmt.Sprintf("%.2f", v) }
+// precStringReal formats a PrecisionStats table with the REAL column only. bestPrec supplies the
+// MAX row: lattigo caps its own MAXLog2Prec at log2(DefaultScale), so that field is always that
+// constant and measures nothing. Err is the error of the SAME slot as Prec, so the two columns of
+// a row always add up to Log2Scale.
+func precStringReal(p ckks.PrecisionStats, bestPrec float64) string {
+	f := func(v float64) string {
+		if math.IsInf(v, 0) {
+			return "inf" // a slot hit exactly: no error to take the log of
+		}
+		return fmt.Sprintf("%.2f", v)
+	}
 	return "\n" + utils.BoxTable("Log2",
 		[]utils.TableGroup{{Name: "REAL", Cols: []string{"Prec", "Err"}}},
 		[]string{"MIN", "MAX", "AVG", "MED", "STD"},
 		[][]string{
-			{f(p.MINLog2Prec.Real), f(p.MINLog2Err.Real)},
-			{f(p.MAXLog2Prec.Real), f(p.MAXLog2Err.Real)},
+			{f(p.MINLog2Prec.Real), f(p.MAXLog2Err.Real)},
+			{f(bestPrec), f(p.Log2Scale - bestPrec)},
 			{f(p.AVGLog2Prec.Real), f(p.AVGLog2Err.Real)},
 			{f(p.MEDLog2Prec.Real), f(p.MEDLog2Err.Real)},
 			{f(p.STDLog2Prec.Real), f(p.STDLog2Err.Real)},
@@ -191,7 +204,7 @@ func precPool(label string, entries []PrecCt, params ckks.Parameters, ecd *ckks.
 	prec := ckks.GetPrecisionStats(params, ecd, dec, wantAll, haveAll, 0, false)
 	table := prec.String()
 	if realOnly {
-		table = precStringReal(prec)
+		table = precStringReal(prec, -math.Log2(agg.Best))
 	}
 	fmt.Printf(" %s (%d ct, %d slots) \n%s", label, len(entries), len(wantAll), table)
 	fmt.Printf(" WORST: %s slot %d  err=%s, margin to flip = %.4f  got=%s want=%s\n",

@@ -101,7 +101,7 @@ func Check(params ckks.Parameters, ecd *ckks.Encoder, dec *rlwe.Decryptor, p Pac
 		}
 	}
 	if bad != 0 {
-		return fmt.Errorf("%d/%d blocks wrong (worst bit margin %.3f); block %d got = %x, want = %x",
+		return fmt.Errorf("%d/%d blocks wrong (worst bit err %.3f); block %d got = %x, want = %x",
 			bad, len(want), worst, first, got[first], want[first])
 	}
 	return nil
