@@ -44,20 +44,56 @@ type Context struct {
 	K      int        // bits packed per ciphertext (t = 2^K)
 	Target int        // Algo1 input level (S2C LevelQ)
 	Canon  rlwe.Scale // canonical output scale after refresh
+
+	Cfg Config // the variants this context runs on
+
+	// Levels that move with the cleaning depth, i.e. with the length of the chain.
+	RefreshLv int // level the refresh hands the state back at
+	ARKLv     int // level AddRoundKey (or the fused XorClean) starts at
+
+	// Levels the round keys have to be encrypted at, which follow Cfg.Place.
+	ARKKeyLv  int // middle rounds
+	LastKeyLv int // last round, no MixColumns
+}
+
+// Config selects the variants a Context runs on. The zero value is the pipeline default: the
+// arithmetic XOR, the 2-level Cleaning, and AddRoundKey then Cleaning as two separate steps.
+//
+// Clean has to be fixed here rather than flipped later: its depth decides how many primes the
+// chain carries, so it is baked into the parameters.
+type Config struct {
+	Xor   aes.XorKind
+	Clean cleaning.Kind
+	Place cleaning.Placement
 }
 
 const (
-	SubBytesLevel = 5  // state level entering a round
-	InitLevel     = 6  // rk0 and the encoded blocks: SubBytesLevel + 1, the square of the XOR
-	RefreshLevel  = 12 // level the refresh hands the state back at
-	ARKLevel      = 9  // RefreshLevel - 3, the depth of MixColumns' XOR tree
+	SubBytesLevel = 5 // state level entering a round; below the cleaning block, so it never moves
+	InitLevel     = 6 // rk0 and the encoded blocks: SubBytesLevel + 1, one level for the XOR
+
+	// DefaultCleanDepth is cleaning.Basic's, i.e. the chain Config's zero value builds.
+	DefaultCleanDepth = 2
+	RefreshLevel      = SubBytesLevel + 4 + DefaultCleanDepth // 11
+	ARKLevel          = RefreshLevel - 3                      // 8
 )
 
-// NewContext builds the whole machinery on the algo1 moduli chain.
-// The AES state lives in the CI ring (sw.CiP)
-// The bootstrap runs in the Std ring
+// RefreshLevelFor and ARKLevelFor are RefreshLevel and ARKLevel on a chain built for a cleaning
+// polynomial of the given depth. Between the refresh and the next round the state pays MixColumns
+// (3), then the XOR (1) and the cleaning (cleanDepth), whatever the placement.
+func RefreshLevelFor(cleanDepth int) int { return SubBytesLevel + 4 + cleanDepth }
+func ARKLevelFor(cleanDepth int) int     { return RefreshLevelFor(cleanDepth) - 3 }
+
+// NewContext builds the whole machinery on the algo1 moduli chain, in its default configuration.
+// The AES state lives in the CI ring (sw.CiP), the bootstrap runs in the Std ring.
 func NewContext(logN, k int) (*Context, error) {
-	params, btpParams, err := params2.TranscipheringParams(logN, k)
+	return NewContextWith(logN, k, Config{})
+}
+
+// NewContextWith is NewContext on the variants cfg selects. The chain is built for cfg.Clean's
+// depth, so RefreshLv and ARKLv follow it.
+func NewContextWith(logN, k int, cfg Config) (*Context, error) {
+	depth := cfg.Clean.Depth()
+	params, btpParams, err := params2.TranscipheringParamsDepth(logN, k, depth)
 	if err != nil {
 		return nil, fmt.Errorf("TranscipheringParams: %w", err)
 	}
@@ -97,6 +133,14 @@ func NewContext(logN, k int) (*Context, error) {
 		K:      k,
 		Target: eval.SlotsToCoeffsParameters.LevelQ,
 		Canon:  sw.CiP.DefaultScale(),
+
+		Cfg:       cfg,
+		RefreshLv: RefreshLevelFor(depth),
+		ARKLv:     ARKLevelFor(depth),
+
+		// CleanOne is the only placement that sends the key straight to the XOR, i.e. below h(state).
+		ARKKeyLv:  ARKLevelFor(depth) - cfg.Place.YDrop(depth),
+		LastKeyLv: RefreshLevelFor(depth) - cfg.Place.YDrop(depth),
 	}
 
 	// Debug decoding contexts: Std (residual) and CI (AES circuit).
@@ -113,25 +157,14 @@ func (c *Context) FirstRound(blocks [][16]byte, rk0 blockpack.Packed) (blockpack
 	if l := rk0[0][0].Level(); l != InitLevel {
 		return blockpack.Packed{}, fmt.Errorf("FirstRound: rk0 at level %d, want InitLevel %d", l, InitLevel)
 	}
-	eval := c.Sw.EvalCI
+	xor := c.AE.PlainOf(c.Cfg.Xor)
 
 	var out blockpack.Packed
 	for g := 0; g < 8; g++ {
 		for b := 0; b < 8; b++ {
-			pt := ckks.NewPlaintext(c.Sw.CiP, InitLevel)
-			pt.Scale = rk0[g][b].Scale
-			if err := c.EcdCI.Encode(blockpack.SlotVec(c.Sw.CiP, blocks, g, b), pt); err != nil {
-				return blockpack.Packed{}, fmt.Errorf("FirstRound encode [%d][%d]: %w", g, b, err)
-			}
-			x, err := eval.SubNew(rk0[g][b], pt)
+			x, err := xor(rk0[g][b], blockpack.SlotVec(c.Sw.CiP, blocks, g, b))
 			if err != nil {
-				return blockpack.Packed{}, fmt.Errorf("FirstRound sub [%d][%d]: %w", g, b, err)
-			}
-			if err := eval.MulRelin(x, x, x); err != nil {
-				return blockpack.Packed{}, fmt.Errorf("FirstRound square [%d][%d]: %w", g, b, err)
-			}
-			if err := eval.Rescale(x, x); err != nil {
-				return blockpack.Packed{}, fmt.Errorf("FirstRound rescale [%d][%d]: %w", g, b, err)
+				return blockpack.Packed{}, fmt.Errorf("FirstRound xor [%d][%d]: %w", g, b, err)
 			}
 			out[g][b] = x
 		}
@@ -255,10 +288,11 @@ func (c *Context) AddRoundKey(st, rk blockpack.Packed) (blockpack.Packed, error)
 	if kl, sl := rk[0][0].Level(), st[0][0].Level(); kl != sl {
 		return blockpack.Packed{}, fmt.Errorf("AddRoundKey: round key at level %d, state at level %d", kl, sl)
 	}
+	xor := c.AE.Of(c.Cfg.Xor)
 	var out blockpack.Packed
 	for g := 0; g < 8; g++ {
 		for b := 0; b < 8; b++ {
-			x, err := c.AE.Xor(st[g][b], rk[g][b])
+			x, err := xor(st[g][b], rk[g][b])
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("AddRoundKey xor [%d][%d]: %w", g, b, err)
 			}
@@ -268,13 +302,14 @@ func (c *Context) AddRoundKey(st, rk blockpack.Packed) (blockpack.Packed, error)
 	return out, nil
 }
 
-// Clean pulls every bit of the state back onto 0 and 1 after the round has spread them.
-// Th second order cleaning function is used here(SmootherCleaning), see discussion in []
+// Clean pulls every bit of the state back onto 0 and 1 after the round has spread them, with the
+// polynomial Cfg.Clean names (SmootherCleaning by default, see discussion in []).
 func (c *Context) Clean(st blockpack.Packed) (blockpack.Packed, error) {
+	clean := c.Cfg.Clean.Func()
 	var out blockpack.Packed
 	for g := 0; g < 8; g++ {
 		for b := 0; b < 8; b++ {
-			cc, err := cleaning.SmootherCleaning(c.Sw.CiP, c.Sw.EvalCI, st[g][b])
+			cc, err := clean(c.Sw.CiP, c.Sw.EvalCI, st[g][b])
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("Clean [%d][%d]: %w", g, b, err)
 			}
@@ -284,12 +319,68 @@ func (c *Context) Clean(st blockpack.Packed) (blockpack.Packed, error) {
 	return out, nil
 }
 
+// XorClean is AddRoundKey and Clean in one step, for the same depth: it cleans the state and the
+// round key (CleanBoth) or the state only (CleanOne) BEFORE XORing them, instead of XORing first
+// and cleaning the result. Cleaning before the XOR keeps the polynomial inside its basin and does
+// not let the XOR amplify what the cleaning just contracted. rk must be at ARKKeyLv.
+func (c *Context) XorClean(st, rk blockpack.Packed) (blockpack.Packed, error) {
+	drop := c.Cfg.Place.YDrop(c.Cfg.Clean.Depth())
+	if kl, sl := rk[0][0].Level(), st[0][0].Level(); kl != sl-drop {
+		return blockpack.Packed{}, fmt.Errorf("XorClean (%s): round key at level %d, state at level %d, want key at %d",
+			c.Cfg.Place, kl, sl, sl-drop)
+	}
+	route, xor, clean := c.Cfg.Place.Func(), c.AE.Of(c.Cfg.Xor), c.Cfg.Clean.Func()
+
+	var out blockpack.Packed
+	for g := 0; g < 8; g++ {
+		for b := 0; b < 8; b++ {
+			x, err := route(c.Sw.CiP, c.Sw.EvalCI, clean, xor, st[g][b], rk[g][b])
+			if err != nil {
+				return blockpack.Packed{}, fmt.Errorf("XorClean [%d][%d]: %w", g, b, err)
+			}
+			out[g][b] = x
+		}
+	}
+	return out, nil
+}
+
+// arkThenClean runs the tail of a round: CleanAfter as the two historical steps, so the caller
+// still gets a trace between the XOR and the polynomial, the other two as one fused XorClean.
+func (c *Context) arkThenClean(st, rk blockpack.Packed, after RoundStep) (blockpack.Packed, error) {
+	if c.Cfg.Place != cleaning.CleanAfter {
+		fmt.Println("---- XorClean ----")
+		t0 := time.Now()
+		out, err := c.XorClean(st, rk)
+		if err != nil {
+			return blockpack.Packed{}, fmt.Errorf("XorClean: %w", err)
+		}
+		after("XorClean", time.Since(t0), out)
+		return out, nil
+	}
+
+	fmt.Println("---- AddRoundKey ----")
+	t0 := time.Now()
+	st, err := c.AddRoundKey(st, rk)
+	if err != nil {
+		return blockpack.Packed{}, fmt.Errorf("AddRoundKey: %w", err)
+	}
+	after("AddRoundKey", time.Since(t0), st)
+
+	fmt.Println("---- Cleaning ----")
+	t0 = time.Now()
+	if st, err = c.Clean(st); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("Cleaning: %w", err)
+	}
+	after("Cleaning", time.Since(t0), st)
+	return st, nil
+}
+
 // RoundStep is called after each operation of a middle round: its name, its duration, the state it
 // produced. That is where a caller hooks its timings and its oracle checks; nil skips it.
 type RoundStep func(name string, dur time.Duration, st blockpack.Packed)
 
 // Round advances the packed state by one AES middle round: SubBytes -> Refresh -> MixColumns ->
-// AddRoundKey -> Cleaning. rk is the round key at ARKLevel, version the SubByte variant (2..4).
+// AddRoundKey -> Cleaning. rk is the round key at ARKKeyLv, version the SubByte variant (1..3).
 func (c *Context) Round(st, rk blockpack.Packed, version int, after RoundStep) (blockpack.Packed, error) {
 	if after == nil {
 		after = func(string, time.Duration, blockpack.Packed) {}
@@ -312,25 +403,14 @@ func (c *Context) Round(st, rk blockpack.Packed, version int, after RoundStep) (
 
 	fmt.Println("---- MixColumns ----")
 	t0 = time.Now()
-	if st, err = c.AE.MixColumns(st); err != nil {
+	if st, err = c.AE.MixColumnsWith(c.AE.Of(c.Cfg.Xor), st); err != nil {
 		return blockpack.Packed{}, fmt.Errorf("Round MixColumns: %w", err)
 	}
 	after("MixColumns", time.Since(t0), st)
 
-	fmt.Println("---- AddRoundKey ----")
-	t0 = time.Now()
-	if st, err = c.AddRoundKey(st, rk); err != nil {
-		return blockpack.Packed{}, fmt.Errorf("Round AddRoundKey: %w", err)
+	if st, err = c.arkThenClean(st, rk, after); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("Round: %w", err)
 	}
-	after("AddRoundKey", time.Since(t0), st)
-
-	fmt.Println("---- Cleaning ----")
-	t0 = time.Now()
-	if st, err = c.Clean(st); err != nil {
-		return blockpack.Packed{}, fmt.Errorf("Round Cleaning: %w", err)
-	}
-	after("Cleaning", time.Since(t0), st)
-
 	return st, nil
 }
 
@@ -358,19 +438,8 @@ func (c *Context) LastRoundV1(st, rk blockpack.Packed, version int, after RoundS
 	}
 	after("Refresh", time.Since(t0), st)
 
-	fmt.Println("---- AddRoundKey ----")
-	t0 = time.Now()
-	if st, err = c.AddRoundKey(st, rk); err != nil {
-		return blockpack.Packed{}, fmt.Errorf("LastRoundV1 AddRoundKey: %w", err)
+	if st, err = c.arkThenClean(st, rk, after); err != nil {
+		return blockpack.Packed{}, fmt.Errorf("LastRoundV1: %w", err)
 	}
-	after("AddRoundKey", time.Since(t0), st)
-
-	fmt.Println("---- Cleaning ----")
-	t0 = time.Now()
-	if st, err = c.Clean(st); err != nil {
-		return blockpack.Packed{}, fmt.Errorf("LastRoundV1 Cleaning: %w", err)
-	}
-	after("Cleaning", time.Since(t0), st)
-
 	return st, nil
 }

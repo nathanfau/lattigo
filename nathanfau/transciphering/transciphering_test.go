@@ -7,19 +7,61 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+
 	"testing"
 	"time"
 
 	"github.com/tuneinsight/lattigo/v6/nathanfau/aes"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/blockpack"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/cleaning"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/debug"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 )
 
 var (
 	nRoundsFlag = flag.Int("rounds", 1, "number of AES middle rounds to run")
-	sbVersion   = flag.Int("subbytes", 2, "SubBytes version (2..4)")
+	sbVersion   = flag.Int("subbytes", 2, "SubBytes version (1..3), by decreasing cost: 247, 98, 69 relin per byte")
+	xorFlag     = flag.String("xor", "nosq", `XOR circuit used throughout: "nosq" for x+y-2xy, "sq" for (x-y)^2`)
+	cleanFlag   = flag.String("clean", "cleaning", `cleaning polynomial: "cleaning" (2 levels), "smoother" or "verysmoother" (3 levels, one prime more)`)
+	placeFlag   = flag.String("place", "after", `where the round cleaning lands: "after" (AddRoundKey then Cleaning), "both" (clean state and key, then XOR) or "one" (clean the state only, then XOR)`)
+	seedFlag    = flag.Int64("seed", 0, "seed of the block draw; 0 draws one from the clock")
 )
+
+// blockSeed fixes WHICH blocks the batch carries, so two configs can be compared on the same
+// input. It does NOT fix the key or the encryption noise, which lattigo draws from crypto/rand:
+// runs on one seed are far closer than on two, not identical.
+func blockSeed() int64 {
+	if *seedFlag != 0 {
+		return *seedFlag
+	}
+	return time.Now().UnixNano()
+}
+
+// config parses the flags before any keygen, so a typo fails in a second instead of a minute.
+func config(t *testing.T) Config {
+	t.Helper()
+	xk, err := aes.ParseXorKind(*xorFlag)
+	if err != nil {
+		t.Fatalf("-xor: %v", err)
+	}
+	ck, err := cleaning.ParseKind(*cleanFlag)
+	if err != nil {
+		t.Fatalf("-clean: %v", err)
+	}
+	pk, err := cleaning.ParsePlacement(*placeFlag)
+	if err != nil {
+		t.Fatalf("-place: %v", err)
+	}
+	return Config{Xor: xk, Clean: ck, Place: pk}
+}
+
+// tail names the steps that close a round, which every placement but "after" merges into one
+func tail(cfg Config) []string {
+	if cfg.Place != cleaning.CleanAfter {
+		return []string{"XorClean"}
+	}
+	return []string{"AddRoundKey", "Cleaning"}
+}
 
 // TestTransciphering runs Context.Round on a full batch of DISTINCT random blocks, one per slot,
 // with a slot / chain / precision trace and a row-major AES-oracle comparison after EVERY
@@ -31,9 +73,11 @@ func TestTransciphering(t *testing.T) {
 	if n < 1 {
 		n = 1
 	}
-	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d \n", n, *sbVersion)
+	cfg := config(t)
+	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d, XOR=%s, clean=%s, place=%s \n",
+		n, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place)
 
-	ctx, err := NewContext(logN, k)
+	ctx, err := NewContextWith(logN, k, cfg)
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -45,7 +89,7 @@ func TestTransciphering(t *testing.T) {
 	key := [16]byte{0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c}
 	rk := aes.KeyExpansion(key[:])
 
-	seed := time.Now().UnixNano()
+	seed := blockSeed()
 	states := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
 	fmt.Printf("random seed = %d  (%d blocks)\n", seed, len(states))
 	for bi := range states {
@@ -59,7 +103,7 @@ func TestTransciphering(t *testing.T) {
 
 	rkHE := make([]blockpack.Packed, n+1)
 	for r := 1; r <= n; r++ {
-		rkHE[r] = encRK(t, ctx, rk[r], len(states), ARKLevel)
+		rkHE[r] = encRK(t, ctx, rk[r], len(states), ctx.ARKKeyLv)
 	}
 
 	fmt.Println("================ input (entry to round 1) ================")
@@ -86,7 +130,7 @@ func TestTransciphering(t *testing.T) {
 					states[bi] = aes.ShiftRowsRM(states[bi])
 				case "MixColumns":
 					states[bi] = aes.MixColumnsRM(states[bi])
-				case "AddRoundKey":
+				case "AddRoundKey", "XorClean":
 					aes.AddRoundKey(states[bi][:], rk[r])
 				}
 			}
@@ -106,7 +150,7 @@ func TestTransciphering(t *testing.T) {
 	fmt.Println("================ timing stats (per round) ================")
 	// Share reference = sum of the op means, so the ops add up to ~100%; "Round" is the wall time
 	// (ops + oracle traces) and gets no share.
-	ops := []string{"SubBytes", "Refresh", "MixColumns", "AddRoundKey", "Cleaning"}
+	ops := append([]string{"SubBytes", "Refresh", "MixColumns"}, tail(cfg)...)
 	var opMeanSum time.Duration
 	for _, name := range ops {
 		if ds := times[name]; len(ds) > 0 {
@@ -132,13 +176,15 @@ func TestTransciphering(t *testing.T) {
 // TestAES runs the whole cipher on a full batch of DISTINCT random blocks:
 // FirstRound -> 9 * Round -> LastRoundV1, with the oracle checked after EVERY operation.
 func TestAES(t *testing.T) {
-	const logN, k = 11, 4
+	const logN, k = 12, 4
 
 	if testing.Short() {
 		t.Skip("full AES: 10 rounds, several minutes")
 	}
 
-	ctx, err := NewContext(logN, k)
+	cfg := config(t)
+
+	ctx, err := NewContextWith(logN, k, cfg)
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -149,10 +195,10 @@ func TestAES(t *testing.T) {
 	rk := aes.KeyExpansion(key[:])
 	nMiddle := len(rk) - 2 // round 0 is the initial ARK, the last one has no MixColumns
 
-	seed := time.Now().UnixNano()
+	seed := blockSeed()
 	blocks := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
-	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, %d blocks, random seed = %d \n",
-		nMiddle, *sbVersion, len(blocks), seed)
+	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, XOR=%s, clean=%s, place=%s, %d blocks, random seed = %d \n",
+		nMiddle, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, len(blocks), seed)
 
 	// The blocks stay in the CLEAR: that is what the client sends and what FirstRound takes.
 	states := make([][16]byte, len(blocks))
@@ -163,9 +209,9 @@ func TestAES(t *testing.T) {
 	rk0 := encRK(t, ctx, rk[0], len(blocks), InitLevel)
 	rkHE := make([]blockpack.Packed, len(rk))
 	for r := 1; r <= nMiddle; r++ {
-		rkHE[r] = encRK(t, ctx, rk[r], len(blocks), ARKLevel)
+		rkHE[r] = encRK(t, ctx, rk[r], len(blocks), ctx.ARKKeyLv)
 	}
-	rkHE[len(rk)-1] = encRK(t, ctx, rk[len(rk)-1], len(blocks), RefreshLevel)
+	rkHE[len(rk)-1] = encRK(t, ctx, rk[len(rk)-1], len(blocks), ctx.LastKeyLv)
 
 	times := map[string][]time.Duration{}
 	tGlobal := time.Now()
@@ -200,7 +246,7 @@ func TestAES(t *testing.T) {
 				states[bi] = aes.ShiftRowsRM(states[bi])
 			case "MixColumns":
 				states[bi] = aes.MixColumnsRM(states[bi])
-			case "AddRoundKey":
+			case "AddRoundKey", "XorClean":
 				aes.AddRoundKey(states[bi][:], rkNow)
 			}
 		}
@@ -230,7 +276,7 @@ func TestAES(t *testing.T) {
 	fmt.Println("================ timing stats ================")
 	// Share reference = sum of the op means, so the ops add up to ~100%; the round totals are wall
 	// time (ops + oracle traces) and get no share.
-	ops := []string{"SubBytes", "Refresh", "MixColumns", "AddRoundKey", "Cleaning"}
+	ops := append([]string{"SubBytes", "Refresh", "MixColumns"}, tail(cfg)...)
 	var opMeanSum time.Duration
 	for _, name := range ops {
 		if ds := times[name]; len(ds) > 0 {
@@ -303,7 +349,7 @@ func report(ctx *Context, st blockpack.Packed, states [][16]byte, round int, ste
 	}
 	debug.PrecPoolCI(fmt.Sprintf("T%d %-11s prec (128 bits) :", round, step), entries...)
 
-	got, margin, err := blockpack.Decrypt(ciP, ctx.EcdCI, ctx.DecCI, st)
+	got, bitErr, err := blockpack.Decrypt(ciP, ctx.EcdCI, ctx.DecCI, st)
 	if err != nil {
 		fmt.Printf("  [T%d] %-11s ORACLE: decrypt error: %v\n", round, step, err)
 		return
@@ -318,10 +364,10 @@ func report(ctx *Context, st blockpack.Packed, states [][16]byte, round int, ste
 		}
 	}
 	if wrong == 0 {
-		fmt.Printf("  [T%d] %-11s ORACLE: TRUE all %d blocks (worst bit margin %.4f)\n", round, step, len(states), margin)
+		fmt.Printf("  [T%d] %-11s ORACLE: TRUE all %d blocks (worst bit err %.4f)\n", round, step, len(states), bitErr)
 		return
 	}
 	w, f := cmp16(got[firstBad], states[firstBad])
-	fmt.Printf("  [T%d] %-11s ORACLE: FALSE %d/%d blocks wrong (worst bit margin %.4f; first bad block %d: %d/16 bytes, first byte %d)\n            got =%x\n            want=%x\n",
-		round, step, wrong, len(states), margin, firstBad, w, f, got[firstBad], states[firstBad])
+	fmt.Printf("  [T%d] %-11s ORACLE: FALSE %d/%d blocks wrong (worst bit err %.4f; first bad block %d: %d/16 bytes, first byte %d)\n            got =%x\n            want=%x\n",
+		round, step, wrong, len(states), bitErr, firstBad, w, f, got[firstBad], states[firstBad])
 }

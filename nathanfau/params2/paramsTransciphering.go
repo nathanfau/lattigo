@@ -38,15 +38,26 @@ func ciThenStd(logN int, logQ, logP []int, logScale int) (ckks.Parameters, error
 	return params, nil
 }
 
-// TranscipheringParams is the Algo1 pipeline parameter set (the leveled AES round + Algo1 refresh
-// of nathanfau/transciphering): MessageRatio = 2^k so q0 = base + k = 42 at k = 4, K = t = 2^k.
+// TranscipheringParams is TranscipheringParamsDepth at the default cleaning depth, 2 levels, i.e.
+// cleaning.Cleaning. It must stay in step with transciphering.DefaultCleanDepth, which cannot be
+// imported here: transciphering already depends on this package.
 func TranscipheringParams(logN, k int) (ckks.Parameters, bootstrapping.Parameters, error) {
+	return TranscipheringParamsDepth(logN, k, 2)
+}
+
+// TranscipheringParamsDepth is the Algo1 pipeline parameter set (the leveled AES round + Algo1
+// refresh of nathanfau/transciphering): MessageRatio = 2^k so q0 = base + k = 42 at k = 4, K = t=2^k.
+func TranscipheringParamsDepth(logN, k, cleanDepth int) (ckks.Parameters, bootstrapping.Parameters, error) {
+	if cleanDepth < 2 || cleanDepth > 3 {
+		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("cleanDepth %d, want 2 or 3", cleanDepth)
+	}
 	logQ := []int{42}
 	logQ = append(logQ, 60)         // SlotsToCoeffs
 	logQ = append(logQ, 38)         // Conv_{Real->Cplx}
 	logQ = append(logQ, 38, 38, 38) // SubBytes
-	logQ = append(logQ, 38, 38)     // cleaning
-	logQ = append(logQ, 38)         // + 1 additional level to run SmootherCleaning or VerySmoothrCleaning
+	for i := 0; i < cleanDepth; i++ {
+		logQ = append(logQ, 38) // cleaning
+	}
 	logQ = append(logQ, 38)         // AddRoundKey
 	logQ = append(logQ, 38, 38, 38) // MixColumns
 	// refresh
