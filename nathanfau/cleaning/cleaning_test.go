@@ -1,6 +1,11 @@
 package cleaning
 
+//	go test ./nathanfau/cleaning/ -v -timeout 0
+//	go test ./nathanfau/cleaning/ -run '^TestCleaning$' -v -timeout 0
+//	go test ./nathanfau/cleaning/ -run '^TestXorClean$' -v -timeout 0
+
 import (
+	"flag"
 	"fmt"
 	"math"
 	"math/rand"
@@ -8,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/aes"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
@@ -32,13 +38,14 @@ type cell struct {
 	dur       time.Duration
 }
 
+// newCleaningContext is the  context of this file
 func newCleaningContext(t *testing.T) (ckks.Parameters, *ckks.Encoder, *rlwe.Encryptor, *rlwe.Decryptor, *ckks.Evaluator) {
 	t.Helper()
 	params, err := ckks.NewParametersFromLiteral(ckks.ParametersLiteral{
 		LogN:            13,
-		LogQ:            []int{55, 40, 40, 40, 40},
-		LogP:            []int{55},
-		LogDefaultScale: 40,
+		LogQ:            []int{50, 38, 38, 38, 38, 38, 38},
+		LogP:            []int{50},
+		LogDefaultScale: 38,
 	})
 	if err != nil {
 		t.Fatalf("params: %v", err)
@@ -129,7 +136,6 @@ func TestCleaning(t *testing.T) {
 
 	printCleaningTable(res, inPrec, inWorst)
 
-	// Sanity: in the clearly-contracting regime, cleaning must not lose precision to the bit.
 	for ei, exp := range expSizes {
 		if exp > 12 {
 			continue
@@ -168,4 +174,279 @@ func printCleaningTable(res [][]cell, inPrec, inWorst []float64) {
 
 	fmt.Printf("Cleaning table\n%s",
 		utils.BoxTable("in avg/worst", groups, leads, rows))
+}
+
+type xorCircuit = func(ckks.Parameters, *ckks.Evaluator, *rlwe.Ciphertext, *rlwe.Ciphertext) (*rlwe.Ciphertext, error)
+
+// xorFn is one two-operand circuit: name identifies it in failures, role is its column header.
+type xorFn struct {
+	name   string
+	role   string
+	levels int
+	fn     xorCircuit
+}
+
+// xorPick names one of the package aes XOR circuits, so a table can be built once per circuit.
+type xorPick func(*aes.Evaluator) aes.XorFunc
+
+var (
+	sq   xorPick = func(a *aes.Evaluator) aes.XorFunc { return a.XorSq }
+	noSq xorPick = func(a *aes.Evaluator) aes.XorFunc { return a.XorNoSq }
+)
+
+func raw(pick xorPick) xorCircuit {
+	return func(_ ckks.Parameters, eval *ckks.Evaluator, x, y *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+		return pick(aes.NewEvaluator(eval))(x, y)
+	}
+}
+
+func after(pick xorPick, clean CleanFunc) xorCircuit {
+	return func(params ckks.Parameters, eval *ckks.Evaluator, x, y *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+		return XorThenClean(params, eval, clean, pick(aes.NewEvaluator(eval)), x, y)
+	}
+}
+
+func beforeBoth(pick xorPick, clean CleanFunc) xorCircuit {
+	return func(params ckks.Parameters, eval *ckks.Evaluator, x, y *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+		return CleanThenXor(params, eval, clean, pick(aes.NewEvaluator(eval)), x, y)
+	}
+}
+
+func beforeOne(pick xorPick, clean CleanFunc) xorCircuit {
+	return func(params ckks.Parameters, eval *ckks.Evaluator, x, y *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+		return CleanOneThenXor(params, eval, clean, pick(aes.NewEvaluator(eval)), x, y)
+	}
+}
+
+// Which polynomial the XOR tables are built around. 'Cleaning' by default
+var xorCleanFlag = flag.String("clean", "cleaning",
+	`cleaning polynomial for the XOR tables: "cleaning", "smoother", "verysmoother" or "all"`)
+
+func xorCleans(t *testing.T) []Kind {
+	t.Helper()
+	if *xorCleanFlag == "all" {
+		return []Kind{Basic, Smoother, VerySmoother}
+	}
+	k, err := ParseKind(*xorCleanFlag)
+	if err != nil {
+		t.Fatalf("-clean: %v", err)
+	}
+	return []Kind{k}
+}
+
+// xorRow is one input error size of the shared sweep
+type xorRow struct {
+	want    []float64
+	cx, cy  *rlwe.Ciphertext         // both noisy, at MaxLevel
+	cyClean *rlwe.Ciphertext         // exact bits, at MaxLevel
+	cyAt    map[int]*rlwe.Ciphertext // exact bits, at MaxLevel-depth
+	inAvg   float64
+	inWorst float64
+}
+
+// xorFixture is what the four XOR tests share: one keygen and one set of ciphertexts, built on
+// first use and reused, so the tables differ by the circuit alone
+type xorFixture struct {
+	params ckks.Parameters
+	ecd    *ckks.Encoder
+	dec    *rlwe.Decryptor
+	eval   *ckks.Evaluator
+	rows   []xorRow
+}
+
+var sharedXorFixture *xorFixture
+
+func xorFix(t *testing.T) *xorFixture {
+	t.Helper()
+	if sharedXorFixture != nil {
+		return sharedXorFixture
+	}
+	params, ecd, enc, dec, eval := newCleaningContext(t)
+	n := params.MaxSlots()
+
+	f := &xorFixture{params: params, ecd: ecd, dec: dec, eval: eval, rows: make([]xorRow, len(expSizes))}
+	for ei, e := range expSizes {
+		rng := rand.New(rand.NewSource(int64(e)))
+		bx, nx := noisyBits(rng, n, e)
+		by, ny := noisyBits(rng, n, e)
+
+		want := make([]float64, n)
+		for s := range want {
+			want[s] = float64(int(bx[s]) ^ int(by[s]))
+		}
+		cx := encryptVals(t, params, ecd, enc, nx, params.MaxLevel())
+		cy := encryptVals(t, params, ecd, enc, ny, params.MaxLevel())
+
+		cyClean := encryptVals(t, params, ecd, enc, by, params.MaxLevel())
+		cyAt := map[int]*rlwe.Ciphertext{}
+		for _, d := range []int{2, 3} {
+			cyAt[d] = encryptVals(t, params, ecd, enc, by, params.MaxLevel()-d)
+		}
+
+		sx, err := utils.BitDistanceCt(ecd, dec, cx, bx, 0)
+		if err != nil {
+			t.Fatalf("input x (e=%d): %v", e, err)
+		}
+		sy, err := utils.BitDistanceCt(ecd, dec, cy, by, 0)
+		if err != nil {
+			t.Fatalf("input y (e=%d): %v", e, err)
+		}
+		f.rows[ei] = xorRow{
+			want: want, cx: cx, cy: cy, cyClean: cyClean, cyAt: cyAt,
+			inAvg:   math.Min(sx.AvgPrec, sy.AvgPrec),
+			inWorst: -math.Log2(math.Max(sx.Worst, sy.Worst)),
+		}
+	}
+	sharedXorFixture = f
+	return f
+}
+
+// sweepCircuits runs circuits over every error size of the shared fixtur
+func sweepCircuits(t *testing.T, f *xorFixture, circuits []xorFn,
+	yOf func(ci, ei int) *rlwe.Ciphertext) [][]cell {
+	t.Helper()
+
+	res := make([][]cell, len(expSizes))
+	for ei := range expSizes {
+		r := f.rows[ei]
+		res[ei] = make([]cell, len(circuits))
+		for ci, c := range circuits {
+			t0 := time.Now()
+			out, err := c.fn(f.params, f.eval, r.cx, yOf(ci, ei))
+			dur := time.Since(t0)
+			if err != nil {
+				t.Fatalf("%s (e=%d): %v", c.name, expSizes[ei], err)
+			}
+			if got := f.params.MaxLevel() - out.Level(); got != c.levels {
+				t.Errorf("%s consumed %d levels, want %d", c.name, got, c.levels)
+			}
+			st, err := utils.BitDistanceCt(f.ecd, f.dec, out, r.want, 0)
+			if err != nil {
+				t.Fatalf("%s (e=%d): %v", c.name, expSizes[ei], err)
+			}
+			res[ei][ci] = cell{st.AvgPrec, -math.Log2(st.Worst), dur}
+		}
+	}
+	return res
+}
+
+// runXorTables prints one table per cleaning polynomial
+func runXorTables(t *testing.T, xorName string, pick xorPick, cleanOne bool) {
+	t.Helper()
+	f := xorFix(t)
+
+	for _, k := range xorCleans(t) {
+		clean, depth := k.Func(), k.Depth()
+
+		var circuits []xorFn
+		var yOf func(ci, ei int) *rlwe.Ciphertext
+		title := fmt.Sprintf("%s, %s", k, xorName)
+
+		if cleanOne {
+			circuits = []xorFn{
+				{xorName + " clean after", "clean after", 1 + depth, after(pick, clean)},
+				{xorName + " clean before", "clean before", depth + 1, beforeBoth(pick, clean)},
+				{xorName + " clean x only", "clean x only", depth + 1, beforeOne(pick, clean)},
+			}
+			// Only the route that never cleans y can take it at h(x)'s level
+			yOf = func(ci, ei int) *rlwe.Ciphertext {
+				if ci == 2 {
+					return f.rows[ei].cyAt[depth]
+				}
+				return f.rows[ei].cyClean
+			}
+			title += "   (y = fresh round key, exact bits)"
+		} else {
+			circuits = []xorFn{
+				{xorName, "Xor", 1, raw(pick)},
+				{xorName + " clean after", "clean after", 1 + depth, after(pick, clean)},
+				{xorName + " clean before", "clean before", depth + 1, beforeBoth(pick, clean)},
+			}
+			yOf = func(_, ei int) *rlwe.Ciphertext { return f.rows[ei].cy }
+		}
+
+		printXorTable(title, circuits, sweepCircuits(t, f, circuits, yOf), f.rows)
+	}
+}
+
+// printXorTable renders one polynomial the way TestCleaning renders its own sweep: one column group
+// per circuit, one row per input error size, each precision followed by its gain over the input.
+func printXorTable(name string, circuits []xorFn, res [][]cell, rows []xorRow) {
+	groups := make([]utils.TableGroup, len(circuits))
+	for i, c := range circuits {
+		groups[i] = utils.TableGroup{
+			Name: fmt.Sprintf("%s (%d lv)", c.role, c.levels),
+			Cols: []string{"avg", "diff avg", "worst", "diff worst", "time"},
+		}
+	}
+
+	leads := make([]string, len(expSizes))
+	out := make([][]string, len(expSizes))
+	for ei := range expSizes {
+		r := rows[ei]
+		leads[ei] = fmt.Sprintf("%.2f/%.2f", r.inAvg, r.inWorst)
+		row := make([]string, 0, 5*len(circuits))
+		for ci := range circuits {
+			c := res[ei][ci]
+			row = append(row,
+				fmt.Sprintf("%.2f", c.precBits), fmt.Sprintf("%+.2f", c.precBits-r.inAvg),
+				fmt.Sprintf("%.2f", c.worstBits), fmt.Sprintf("%+.2f", c.worstBits-r.inWorst),
+				c.dur.Round(time.Millisecond).String())
+		}
+		out[ei] = row
+	}
+
+	fmt.Printf("XOR cleaned with %s\n%s", name,
+		utils.BoxTable("in avg/worst", groups, leads, out))
+}
+
+// TestXorCleanByHand asks whether evaluating the composed polynomial by hand beats going through
+// the package Cleaning, which routes h via lattigo's polynomial evaluator and its own scale
+// bookkeeping. Two tables per XOR circuit: CleanThenXor on two noisy operands, then
+// CleanOneThenXor on a y that is a fresh round key.
+func TestXorCleanByHand(t *testing.T) {
+	const depth = 2 // the by-hand circuits only implement Cleaning
+	f := xorFix(t)
+
+	for _, v := range []struct {
+		name      string
+		pick      xorPick
+		both, one xorCircuit
+	}{
+		{"XorSq", sq, cleanThenXorSqByHand, cleanOneThenXorSqByHand},
+		{"XorNoSq", noSq, cleanThenXorNoSqByHand, cleanOneThenXorNoSqByHand},
+	} {
+		both := []xorFn{
+			{v.name + " both composed", "CleanThenXor", depth + 1, beforeBoth(v.pick, Cleaning)},
+			{v.name + " both by hand", "by hand", depth + 1, v.both},
+		}
+		res := sweepCircuits(t, f, both, func(_, ei int) *rlwe.Ciphertext { return f.rows[ei].cy })
+		printXorTable("Cleaning, "+v.name+"   CleanThenXor", both, res, f.rows)
+
+		one := []xorFn{
+			{v.name + " one composed", "CleanOneThenXor", depth + 1, beforeOne(v.pick, Cleaning)},
+			{v.name + " one by hand", "by hand", depth + 1, v.one},
+		}
+		res = sweepCircuits(t, f, one, func(_, ei int) *rlwe.Ciphertext { return f.rows[ei].cyAt[depth] })
+		printXorTable("Cleaning, "+v.name+"   CleanOneThenXor (y = round key)", one, res, f.rows)
+	}
+}
+
+func TestXorCleanSq(t *testing.T)      { runXorTables(t, "XorSq", sq, false) }
+func TestXorCleanNoSq(t *testing.T)    { runXorTables(t, "XorNoSq", noSq, false) }
+func TestXorCleanOneSq(t *testing.T)   { runXorTables(t, "XorSq", sq, true) }
+func TestXorCleanOneNoSq(t *testing.T) { runXorTables(t, "XorNoSq", noSq, true) }
+
+// encryptVals encrypts a full slot vector at the top level.
+func encryptVals(t *testing.T, params ckks.Parameters, ecd *ckks.Encoder, enc *rlwe.Encryptor, vals []float64, level int) *rlwe.Ciphertext {
+	t.Helper()
+	pt := ckks.NewPlaintext(params, level)
+	if err := ecd.Encode(vals, pt); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	ct, err := enc.EncryptNew(pt)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	return ct
 }
