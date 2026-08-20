@@ -62,7 +62,7 @@ four times it when `ex` and `ey` reinforce instead of cancelling.
 
 Half the slots therefore come out cleaned and half come out amplified. Over thousands
 of slots the extreme of that second half is always drawn, so the worst slot pays the
-full `4e`, a solid 2 bits -- and the worst slot is the only thing that decides whether
+full `4e`. The worst slot is the only thing that decides whether
 a transciphering round fails.
 
 That is the whole tension: the square buys a lot of average precision from the half
@@ -94,6 +94,20 @@ matches cleaning both for half the polynomial work. And the basin becomes a real
 hazard: at input 2^-2, `XorSq` followed by cleaning reaches worst = -3.35 bits
 (absolute error ~10) because the XOR pushed values out of [0,1] and the polynomial
 diverged instead of contracting; cleaning first keeps both operands inside it.
+
+### `q0` can be freed from the message ratio
+
+Lattigo couples the bottom prime to the scale by `log2(q0) = LogDefaultScale + LogMessageRatio`,
+which costs 4 bits of `q0` at `k = 4` (`42 = 38 + 4`). The coupling can be dropped: set
+`LogMessageRatio = 0` and carry the `1/t` in the `SlotsToCoeffs` scaling, bringing `q0` down to
+`38`. The `ScaleDown` guard compares `q0/scale` to `MessageRatio` and both sides drop by `2^k`,
+so it still passes; and `qDiv` becomes 1, so `CoeffsToSlots` regains the factor `t` that
+`SlotsToCoeffs` gives up, so nothing downstream is recalibrated. Tested end to end on `algo1`:
+it works, and it is more faithful. But it is also less precise, for 4 bits of `LogQP`... not
+enough to be worth it, so we keep `q0 = 42`.
+
+Trap: `F = (ScalingFactor/MessageRatio)/DefaultScale` cancels exactly the `StCScaling` lattigo
+applies on top, so `Scaling = F` is net-neutral whatever the ratio. It has to be written `F/t`.
 
 ## Testing
 

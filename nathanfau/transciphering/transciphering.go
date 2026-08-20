@@ -192,31 +192,24 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 	eval := c.Eval
 	ck := eval.Evaluator
 
-	// 1. CI -> Std, per bit.
-	var stdFold [8][8]*rlwe.Ciphertext
-	for g := 0; g < 8; g++ {
-		for b := 0; b < 8; b++ {
-			s, err := c.Sw.CIToStandard(st[g][b])
-			if err != nil {
-				return blockpack.Packed{}, fmt.Errorf("refresh CIToStandard [%d][%d]: %w", g, b, err)
-			}
-			stdFold[g][b] = s
-		}
-	}
-
-	// 2. BitPack 4-bit nibbles: packet 2g = low nibble (bits 0..3), 2g+1 = high nibble (bits 4..7);
-	//    each packet is byte_g(nibble) + i*byte_{g+8}(nibble).
+	// 1-2. BitPack the 4-bit nibbles in CI, then convert to Std
 	var packed [16]*rlwe.Ciphertext
 	for g := 0; g < 8; g++ {
-		lo, err := bitbatching.BitPack(ck, stdFold[g][0:4])
+		lo, err := bitbatching.BitPack(c.Sw.EvalCI, st[g][0:4])
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh BitPack low g=%d: %w", g, err)
 		}
-		hi, err := bitbatching.BitPack(ck, stdFold[g][4:8])
+		hi, err := bitbatching.BitPack(c.Sw.EvalCI, st[g][4:8])
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh BitPack high g=%d: %w", g, err)
 		}
-		packed[2*g], packed[2*g+1] = lo, hi
+		for i, ciNib := range [2]*rlwe.Ciphertext{lo, hi} {
+			s, err := c.Sw.CIToStandard(ciNib)
+			if err != nil {
+				return blockpack.Packed{}, fmt.Errorf("refresh CIToStandard g=%d nibble %d: %w", g, i, err)
+			}
+			packed[2*g+i] = s
+		}
 	}
 
 	// 3. algo1.Extract per packet (drop to the Algo1 input level first).
