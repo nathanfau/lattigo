@@ -31,6 +31,14 @@ func gfMul(a, b byte) byte {
 	return p
 }
 
+// GFMul and SBox expose the two primitives above to the other packages. They are thin wrappers
+// rather than renames so the call sites in here stay untouched; whtranscipher needs both to
+// build the Walsh spectrum of S_r, and neither should be restated by hand elsewhere.
+func GFMul(a, b byte) byte { return gfMul(a, b) }
+
+// SBox returns S(m), the AES S-box.
+func SBox(m byte) byte { return sbox[m] }
+
 // gfInv returns the multiplicative inverse of a in GF(2^8) (0 maps to 0).
 func gfInv(a byte) byte {
 	if a == 0 {

@@ -50,3 +50,17 @@ func VerySmootherCleaning(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe
 	}
 	return out, nil
 }
+
+// SignCleaning refines a slot carrying +1 or -1.
+// It consumes the same ceil(log2(deg+1)) = 2 levels as Cleaning.
+func SignCleaning(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+	poly := bignum.NewPolynomial(bignum.Monomial, []complex128{0, 1.5, 0, -0.5}, nil)
+	polyEval := polynomial.NewEvaluator(params, eval)
+
+	W := ct.Scale
+	out, err := polyEval.Evaluate(ct.CopyNew(), poly, W)
+	if err != nil {
+		return nil, fmt.Errorf("SignCleaning: %w", err)
+	}
+	return out, nil
+}

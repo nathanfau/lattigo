@@ -176,7 +176,7 @@ func TestTransciphering(t *testing.T) {
 // TestAES runs the whole cipher on a full batch of DISTINCT random blocks:
 // FirstRound -> 9 * Round -> LastRoundV1, with the oracle checked after EVERY operation.
 func TestAES(t *testing.T) {
-	const logN, k = 11, 4
+	const logN, k = 12, 4
 
 	if testing.Short() {
 		t.Skip("full AES: 10 rounds, several minutes")

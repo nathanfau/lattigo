@@ -176,6 +176,95 @@ func printCleaningTable(res [][]cell, inPrec, inWorst []float64) {
 		utils.BoxTable("in avg/worst", groups, leads, rows))
 }
 
+// signExpSizes stops at 22: past that the output of h sits under the noise floor of the 2^38 scale
+// and the quadratic law can no longer be read.
+var signExpSizes = []int{1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22}
+
+// noisySigns is noisyBits for the {-1,+1} alphabet: a random sign perturbed by |err| ~ 2^-exp,
+// with the same jitter, so the slots do not all sit at the same distance and the worst one means
+// something.
+func noisySigns(rng *rand.Rand, n, exp int) (sign, in []float64) {
+	noise := math.Exp2(-float64(exp))
+	jitter := jitterFrac(exp)
+	sign = make([]float64, n)
+	in = make([]float64, n)
+	for s := 0; s < n; s++ {
+		b := float64(rng.Intn(2)*2 - 1)
+		sign[s] = b
+		dir := float64(rng.Intn(2)*2 - 1)
+		mag := noise * (1 + (rng.Float64()*2-1)*jitter)
+		in[s] = b + dir*mag
+	}
+	return sign, in
+}
+
+// TestSignCleaning sweeps SignCleaning over a range of input error sizes and checks the law it
+// rests on: h(±1+e) = ±1 - (3e² ± e³)/2, so |e| -> 1.5|e|² and the worst slot goes from p to
+// 2p - log2(1.5) bits. One bit better per level than the {0,1} cleaning 3x²-2x³, which loses 1.58.
+func TestSignCleaning(t *testing.T) {
+	params, ecd, enc, dec, eval := newCleaningContext(t)
+	n := params.MaxSlots()
+
+	const lossBits = 0.5849625007211562 // log2(1.5)
+
+	leads := make([]string, len(signExpSizes))
+	rows := make([][]string, len(signExpSizes))
+
+	for ei, exp := range signExpSizes {
+		rng := rand.New(rand.NewSource(int64(exp)))
+		sign, in := noisySigns(rng, n, exp)
+
+		ct := encryptVals(t, params, ecd, enc, in, params.MaxLevel())
+		stIn, err := utils.BitDistanceCt(ecd, dec, ct, sign, 0)
+		if err != nil {
+			t.Fatalf("input (exp=2^-%d): %v", exp, err)
+		}
+
+		t0 := time.Now()
+		out, err := SignCleaning(params, eval, ct)
+		dur := time.Since(t0)
+		if err != nil {
+			t.Fatalf("SignCleaning (exp=2^-%d): %v", exp, err)
+		}
+		if used := params.MaxLevel() - out.Level(); used != 2 {
+			t.Errorf("SignCleaning consumed %d levels, want 2", used)
+		}
+
+		stOut, err := utils.BitDistanceCt(ecd, dec, out, sign, 0)
+		if err != nil {
+			t.Fatalf("output (exp=2^-%d): %v", exp, err)
+		}
+
+		inWorst, outWorst := -math.Log2(stIn.Worst), -math.Log2(stOut.Worst)
+		predicted := 2*inWorst - lossBits
+
+		leads[ei] = fmt.Sprintf("%.2f/%.2f", stIn.AvgPrec, inWorst)
+		rows[ei] = []string{
+			fmt.Sprintf("%.2f", stOut.AvgPrec), fmt.Sprintf("%+.2f", stOut.AvgPrec-stIn.AvgPrec),
+			fmt.Sprintf("%.2f", outWorst), fmt.Sprintf("%+.2f", outWorst-inWorst),
+			dur.Round(time.Microsecond).String(),
+		}
+
+		// The law only holds while the result stays above the noise floor of the scale.
+		if exp <= 12 {
+			if outWorst < inWorst {
+				t.Errorf("SignCleaning regressed at exp=2^-%d: worst %.2f b -> %.2f b", exp, inWorst, outWorst)
+			}
+			if math.Abs(outWorst-predicted) > 1 {
+				t.Errorf("exp=2^-%d: worst slot %.2f b, the quadratic law predicts %.2f b", exp, outWorst, predicted)
+			}
+		}
+	}
+
+	fmt.Printf("SignCleaning, h(x) = (3x-x^3)/2 on +-1\n%s",
+		utils.BoxTable("in avg/worst",
+			[]utils.TableGroup{{
+				Name: "SignCleaning (2 lv)",
+				Cols: []string{"avg", "diff avg", "worst", "diff worst", "time"},
+			}},
+			leads, rows))
+}
+
 type xorCircuit = func(ckks.Parameters, *ckks.Evaluator, *rlwe.Ciphertext, *rlwe.Ciphertext) (*rlwe.Ciphertext, error)
 
 // xorFn is one two-operand circuit: name identifies it in failures, role is its column header.

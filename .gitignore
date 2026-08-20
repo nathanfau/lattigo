@@ -54,9 +54,8 @@ _testmain.go
 /Coding
 
 
-# archive locale free-XOR / XBOOT (jamais poussée)
+# archives locales (jamais poussées)
 nathanfau/_freexor/
-nathanfau/_old/
 nathanfau/_scale33/
 
 # sorties -v des runs de test, le sweep et le tee qui les produisent.
@@ -66,5 +65,4 @@ nathanfau/logs/
 nathanfau/transciphering/logging_test.go
 
 # expérimentations locales
-nathanfau/transciphering/q37_test.go
-nathanfau/transciphering/cleanearly_test.go
+nathanfau/blockenc/blt/blt_test.go
