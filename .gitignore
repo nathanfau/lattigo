@@ -66,3 +66,6 @@ nathanfau/transciphering/logging_test.go
 
 # expérimentations locales
 nathanfau/blockenc/blt/blt_test.go
+
+# outils de tracé et leurs sorties : du Python et des PNG, pas du code de la bibliothèque
+nathanfau/cleaning/cleanplot/

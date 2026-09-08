@@ -2,303 +2,290 @@ package bitbatching
 
 import (
 	"fmt"
-	"math/bits"
 
-	"github.com/tuneinsight/lattigo/v6/circuits/common/polynomial"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
-	"github.com/tuneinsight/lattigo/v6/utils/bignum"
 )
 
-// BitExtract homomorphically extracts k bits from ct encrypting {omega^{m_s}}.
+// The three ways of getting the k bits of m back out of a ciphertext whose slots hold omega^m,
+// omega = exp(2i.pi/2^k). Same signature, same output order, same output scale and level, so a
+// caller can hold any of them behind one variable -- transciphering.Config.Extract does.
+//
+//	BitExtract        half spectrum, [BBBTS] 3.2       k levels    error LINEAR in the input error
+//	BitExtractInterp  plain interpolation, Lemma 3     k levels    error linear, worse constant
+//	BitExtractClean   interpolation + cleaning, 3.3    k+1 levels  error QUADRATIC
+//
+// BitExtractInterp is the control, called by no one else: same interpolants as BitExtract but
+// whole, same targets as BitExtractClean but without the bivariate lift, so a comparison against it
+// attributes a gain to the right cause.
+//
+// Below them, the evaluation of h ([BBBTS] 3.3) that BitExtractClean drives. Only the real-target
+// form h = F0 + 2.Re(U + x.conj(x).W) has an evaluator here, which is all the bit functions need;
+// its coefficients are built in cleaninterp.go.
+
+// BitExtract homomorphically extracts the k bits of m from ct encrypting omega^m, omega =
+// exp(2i.pi/2^k).
+//
+// [BBBTS] 3.2. P_{k,l} is supported on the odd multiples of step = 2^{k-l-1} (Lemma 3), and the bit
+// being real, its upper spectrum is the conjugate of its lower one. Only HALF is evaluated and one
+// conjugation brings the rest back, constant term included. The error stays LINEAR: (t/4).eps at
+// worst, on the LSB.
+//
+// The LSB is a special case: X^{t/2} is (-1)^m, already real on the roots, so it needs neither a
+// half spectrum nor a conjugation.
 func BitExtract(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext, k int) ([]*rlwe.Ciphertext, error) {
 	if k < 1 {
 		return nil, fmt.Errorf("BitExtract: k must be >= 1")
 	}
 
-	W := ct.Scale
-
-	// keep the powers of 2 of X (ct) in memory so we don't recompute them every time
-	pb := polynomial.NewPowerBasis(ct, bignum.Monomial)
-	for i := 1; i < k; i++ {
-		if err := pb.GenPower(1<<i, false, eval); err != nil {
-			return nil, fmt.Errorf("BitExtract GenPower 2^%d: %w", i, err)
-		}
-	}
-
-	// compute all the other powers
-	for iter := k - 1; iter >= 1; iter-- {
-		stride := 1 << (k - iter)
-		L := 1 << (iter - 1)
-		if L < 2 {
-			continue
-		}
-		bsIdx, gsIdx := psPowerIndices(stride, L)
-		for _, idx := range append(append([]int{}, bsIdx...), gsIdx...) {
-			if idx <= 1 {
-				continue
-			}
-			if err := pb.GenPower(idx, false, eval); err != nil {
-				return nil, fmt.Errorf("BitExtract GenPower X^%d: %w", idx, err)
-			}
-		}
-	}
+	t := 1 << k
+	c := newPolyCtx(params, eval, ct)
 
 	results := make([]*rlwe.Ciphertext, k)
+	for l := 0; l < k; l++ {
+		pkl := ComputePkl(k, l)
+		step := 1 << (k - l - 1)
 
-	// exactly the BKSS algorithm
-	for iter := k - 1; iter >= 1; iter-- {
-
-		// computation of the polynomials P and Q (see polys.go)
-		pkl := ComputePkl(k, iter)
-		q := ComputeQkl(k, iter, pkl)
-
-		prefix := pb.Value[1<<(k-iter-1)]
-
-		var ctQ *rlwe.Ciphertext
-		var err error
-
-		if len(q) == 1 {
-			ctQ = nil
+		coeffs := make([]complex128, t)
+		if l == 0 {
+			coeffs[0], coeffs[t/2] = pkl[0], pkl[t/2]
 		} else {
-			stride := 1 << (k - iter)
-			bsIdx, gsIdx := psPowerIndices(stride, len(q))
-			if ctQ, err = evaluateCustomPS(eval, []complex128(q), bsIdx, gsIdx, &pb, W); err != nil {
-				return nil, fmt.Errorf("BitExtract iter=%d evaluateCustomPS: %w", iter, err)
+			for p, v := range ComputeQkl(k, l, pkl) {
+				coeffs[step*(2*p+1)] = v
 			}
 		}
 
-		var tmp *rlwe.Ciphertext
-		if ctQ == nil {
-			tmp = prefix.CopyNew()
-			if err = eval.Mul(tmp, q[0], tmp); err != nil {
-				return nil, fmt.Errorf("BitExtract iter=1 Mul: %w", err)
-			}
-			if err = eval.RescaleTo(tmp, W, tmp); err != nil {
-				return nil, fmt.Errorf("BitExtract iter=1 RescaleTo: %w", err)
-			}
-		} else {
-			p := prefix.CopyNew()
-			qClone := ctQ.CopyNew()
-			utils.AlignLevels(eval, p, qClone)
-			tmp = p.CopyNew()
-			if err = eval.MulRelin(p, qClone, tmp); err != nil {
-				return nil, fmt.Errorf("BitExtract iter=%d MulRelin prefix×Q: %w", iter, err)
-			}
-			if err = eval.RescaleTo(tmp, W, tmp); err != nil {
-				return nil, fmt.Errorf("BitExtract iter=%d RescaleTo prefix×Q: %w", iter, err)
-			}
+		out, err := c.evalAt(coeffs, c.W)
+		if err != nil {
+			return nil, fmt.Errorf("BitExtract bit %d: %w", l, err)
+		}
+		if out == nil {
+			return nil, fmt.Errorf("BitExtract bit %d: empty interpolant", l)
 		}
 
-		// recover the real part (the bit)
-		if err = eval.Add(tmp, complex(0.25, 0), tmp); err != nil {
-			return nil, fmt.Errorf("BitExtract iter=%d Add 1/4: %w", iter, err)
+		if l > 0 {
+			if out, err = realFold(eval, pkl[0], out); err != nil {
+				return nil, fmt.Errorf("BitExtract bit %d fold: %w", l, err)
+			}
 		}
-		ctConj := tmp.CopyNew()
-		if err = eval.Conjugate(ctConj, ctConj); err != nil {
-			return nil, fmt.Errorf("BitExtract iter=%d Conjugate: %w", iter, err)
-		}
-		ctEll := tmp.CopyNew()
-		if err = eval.Add(ctEll, ctConj, ctEll); err != nil {
-			return nil, fmt.Errorf("BitExtract iter=%d Add+conj: %w", iter, err)
-		}
-		results[iter] = ctEll
+		results[l] = out
 	}
 
-	ct0 := pb.Value[1<<(k-1)].CopyNew()
-	if err := eval.Mul(ct0, complex(-0.5, 0), ct0); err != nil {
-		return nil, fmt.Errorf("BitExtract LSB Mul: %w", err)
-	}
-	if err := eval.RescaleTo(ct0, W, ct0); err != nil {
-		return nil, fmt.Errorf("BitExtract LSB RescaleTo: %w", err)
-	}
-	if err := eval.Add(ct0, complex(0.5, 0), ct0); err != nil {
-		return nil, fmt.Errorf("BitExtract LSB Add: %w", err)
-	}
-	results[0] = ct0
-
-	// normalize scale/level of every ct
-	for i := range results {
-		if err := utils.ForceScale(eval, results[i], W); err != nil {
-			return nil, fmt.Errorf("BitExtract scale normalization bit %d: %w", i, err)
-		}
-	}
-	minLvl := results[0].Level()
-	for _, r := range results {
-		if r.Level() < minLvl {
-			minLvl = r.Level()
-		}
-	}
-	for i := range results {
-		if d := results[i].Level() - minLvl; d > 0 {
-			eval.DropLevel(results[i], d)
-		}
-	}
-
+	utils.FlattenLevels(eval, results)
 	return results, nil
 }
 
-// babyStepM returns the number of baby-steps m (a power of 2) of the PS for a degree-L polynomial.
-func babyStepM(L int) int {
-	deg := L - 1
-	if deg < 1 {
-		return 1
-	}
-	logDegree := bits.Len(uint(deg))
-	logSplit := bignum.OptimalSplit(logDegree)
-	return 1 << logSplit
-}
-
-// psPowerIndices returns the baby-step and giant-step indices.
-func psPowerIndices(stride, L int) (bs, gs []int) {
-	m := babyStepM(L)
-	maxBaby := m - 1
-	if maxBaby > L-1 {
-		maxBaby = L - 1
-	}
-	for i := 1; i <= maxBaby; i++ {
-		bs = append(bs, stride*i)
-	}
-	for g := m; g <= L-1; g *= 2 {
-		gs = append(gs, stride*g)
-	}
-	return
-}
-
-type psNode struct {
-	ct  *rlwe.Ciphertext
-	cst complex128
-}
-
-// evaluateCustomPS is a custom Paterson-Stockmeyer evaluation that reuses pb (the power
-// basis)
-// as noted above (l22), the power basis is not recomputed, which saves work.
-/*
-
-
-FLAG
-this claim looks true but I should verify it
-
-
-
-*/
-func evaluateCustomPS(eval *ckks.Evaluator, coeffs []complex128, bsIdx, gsIdx []int, pb *polynomial.PowerBasis, W rlwe.Scale) (*rlwe.Ciphertext, error) {
-	if len(bsIdx) == 0 {
-		return nil, fmt.Errorf("evaluateCustomPS: empty bsIdx (insufficient degree)")
-	}
-	stride := bsIdx[0]
-	var m int
-	if len(gsIdx) > 0 {
-		m = gsIdx[0] / stride
-	} else {
-		m = len(bsIdx) + 1
+// BitExtractInterp extracts the k bits through the PLAIN Lagrange interpolation of Lemma 3, no
+// cleaning: the control. Error LINEAR, with a slightly worse constant than the half spectrum.
+//
+// Same k levels as the other two: its degree t-1 and BitExtract's X^{t/2} round up to the same
+// ceil(log2(.)). The half spectrum buys ciphertext products, not depth.
+func BitExtractInterp(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext, k int) ([]*rlwe.Ciphertext, error) {
+	if k < 1 {
+		return nil, fmt.Errorf("BitExtractInterp: k must be >= 1")
 	}
 
-	var rec func(c []complex128) (psNode, error)
-	rec = func(c []complex128) (psNode, error) {
-		n := len(c)
+	c := newPolyCtx(params, eval, ct)
 
-		if n <= m {
-			return babyStepEval(eval, c, stride, pb, W)
-		}
-
-		g := m
-		for g*2 <= n-1 {
-			g *= 2
-		}
-
-		low, err := rec(c[:g])
+	results := make([]*rlwe.Ciphertext, k)
+	for l := 0; l < k; l++ {
+		out, err := c.evalAt(ComputePkl(k, l), c.W)
 		if err != nil {
-			return psNode{}, err
+			return nil, fmt.Errorf("BitExtractInterp bit %d: %w", l, err)
 		}
-		high, err := rec(c[g:])
+		if out == nil {
+			return nil, fmt.Errorf("BitExtractInterp bit %d: empty interpolant", l)
+		}
+		results[l] = out
+	}
+
+	utils.FlattenLevels(eval, results)
+	return results, nil
+}
+
+// BitExtractClean extracts the k bits like BitExtract, but through the combined interpolation and
+// cleaning, so the bits come out cleaned. Every target is real, so the symmetrised rank t/2
+// collapses h to two polynomials per bit instead of four.
+//
+// k+1 levels, one more than BitExtract (5 at k = 4, measured): U costs k on its own, the x.conj(x)
+// side is a level shallower but pays it back on the product with u, and one more on the rescaling
+// settle closes -- that last one is the only one that could still be argued with.
+func BitExtractClean(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext, k int) ([]*rlwe.Ciphertext, error) {
+	if k < 1 {
+		return nil, fmt.Errorf("BitExtractClean: k must be >= 1")
+	}
+
+	c := newPolyCtx(params, eval, ct)
+
+	u, err := rootNorm(eval, ct, c.W)
+	if err != nil {
+		return nil, fmt.Errorf("BitExtractClean: %w", err)
+	}
+
+	results := make([]*rlwe.Ciphertext, k)
+	for l := 0; l < k; l++ {
+		ci, err := NewCleanInterp(BitTargets(k, l), true)
 		if err != nil {
-			return psNode{}, err
+			return nil, fmt.Errorf("BitExtractClean bit %d: %w", l, err)
+		}
+		if !ci.Symmetric() {
+			return nil, fmt.Errorf("BitExtractClean bit %d: V != U, the real-target collapse does not hold", l)
 		}
 
-		Zg := pb.Value[stride*g]
-		if Zg == nil {
-			return psNode{}, fmt.Errorf("evaluateCustomPS: giant X^%d missing from pb", stride*g)
-		}
-		var highCt *rlwe.Ciphertext
-		if high.ct == nil {
-			highCt = Zg.CopyNew()
-			if err = eval.Mul(highCt, high.cst, highCt); err != nil {
-				return psNode{}, fmt.Errorf("giant Mul const: %w", err)
-			}
-			if err = eval.RescaleTo(highCt, W, highCt); err != nil {
-				return psNode{}, fmt.Errorf("giant RescaleTo const: %w", err)
-			}
+		var out *rlwe.Ciphertext
+		if l == 0 {
+			out, err = cleanLSB(c, ci, u)
 		} else {
-			highCt = high.ct
-			zc := Zg.CopyNew()
-			utils.AlignLevels(eval, highCt, zc)
-			if err = eval.MulRelin(highCt, zc, highCt); err != nil {
-				return psNode{}, fmt.Errorf("giant MulRelin: %w", err)
-			}
-			if err = eval.RescaleTo(highCt, W, highCt); err != nil {
-				return psNode{}, fmt.Errorf("giant RescaleTo: %w", err)
-			}
+			out, err = evalSym(c, ci, u)
 		}
-
-		if low.ct == nil {
-			if err = eval.Add(highCt, low.cst, highCt); err != nil {
-				return psNode{}, fmt.Errorf("giant Add low const: %w", err)
-			}
-			return psNode{ct: highCt}, nil
+		if err != nil {
+			return nil, fmt.Errorf("BitExtractClean bit %d: %w", l, err)
 		}
-		lc := low.ct
-		utils.AlignLevels(eval, lc, highCt)
-		if err = eval.Add(lc, highCt, lc); err != nil {
-			return psNode{}, fmt.Errorf("giant Add low: %w", err)
+		if err = checkScale(fmt.Sprintf("BitExtractClean bit %d result", l), out.Scale, c.W); err != nil {
+			return nil, err
 		}
-		return psNode{ct: lc}, nil
+		out.Scale = c.W
+		results[l] = out
 	}
 
-	node, err := rec(coeffs)
+	utils.FlattenLevels(eval, results)
+	return results, nil
+}
+
+// evalSym evaluates h in its real-target form, F0 + 2.Re(U + u.W), the body BitExtractClean runs on
+// every bit but the LSB. U comes out on W, and W is produced at the scale that makes u.W land back
+// on W, so everything meets there and the additions are exact.
+func evalSym(c *polyCtx, ci CleanInterp, u *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+	depthW := polyDepth(ci.W)
+
+	ctU, err := c.evalAt(ci.U, c.W)
+	if err != nil {
+		return nil, fmt.Errorf("U: %w", err)
+	}
+	ctW, err := c.evalAt(ci.W, c.normTarget(depthW, u, c.W))
+	if err != nil {
+		return nil, fmt.Errorf("W: %w", err)
+	}
+	c.pinLevel(ctW, depthW)
+
+	return assembleSym(c.eval, ci.F0, ctU, ctW, u, c.W)
+}
+
+// cleanLSB is h for the LSB, whose U and W both reduce to the monomial X^{t/2}. Evaluated as two
+// polynomials, u.W would sit a level below U and set the depth of the whole extraction; factoring
+// as h = F0 + 2.Re((A + C.u).X^{t/2}) keeps it level with the other bits. lambda puts the result on
+// W, which the polynomial evaluator would otherwise have done.
+func cleanLSB(c *polyCtx, ci CleanInterp, u *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+	s := ci.T / 2
+	xs, err := c.power(s)
 	if err != nil {
 		return nil, err
 	}
-	if node.ct == nil {
-		return nil, fmt.Errorf("evaluateCustomPS: unexpected constant result")
+
+	mulLvl := min(u.Level()-1, xs.Level())
+	lam := complex(c.W.Mul(qScale(c.params, mulLvl)).Div(u.Scale.Mul(xs.Scale)).Float64(), 0)
+
+	acc := u.CopyNew()
+	if err = c.eval.Mul(acc, ci.W[s]*lam, acc); err != nil {
+		return nil, fmt.Errorf("cleanLSB Mul C: %w", err)
 	}
-	return node.ct, nil
+	if err = c.eval.RescaleTo(acc, c.W, acc); err != nil {
+		return nil, fmt.Errorf("cleanLSB RescaleTo C: %w", err)
+	}
+	if err = c.eval.Add(acc, ci.U[s]*lam, acc); err != nil {
+		return nil, fmt.Errorf("cleanLSB Add A: %w", err)
+	}
+
+	xc := xs.CopyNew()
+	utils.AlignLevels(c.eval, acc, xc)
+	if err = c.eval.MulRelin(acc, xc, acc); err != nil {
+		return nil, fmt.Errorf("cleanLSB MulRelin: %w", err)
+	}
+	if err = c.eval.RescaleTo(acc, c.W, acc); err != nil {
+		return nil, fmt.Errorf("cleanLSB RescaleTo: %w", err)
+	}
+	// The product lands on s_u.s_x/q, not on W: lambda corrected the VALUE, the only freedom a
+	// scalar multiplication gives. Once that is checked, assigning W is a true statement.
+	if err = checkScale("cleanLSB", acc.Scale, u.Scale.Mul(xs.Scale).Div(qScale(c.params, mulLvl))); err != nil {
+		return nil, err
+	}
+	acc.Scale = c.W
+
+	return realFold(c.eval, ci.F0, acc)
 }
 
-func babyStepEval(eval *ckks.Evaluator, c []complex128, stride int, pb *polynomial.PowerBasis, W rlwe.Scale) (psNode, error) {
-	var acc *rlwe.Ciphertext
-	for i := 1; i < len(c); i++ {
-		if c[i] == 0 {
-			continue
+// rootNorm returns u = x.conj(x), the |x|^2 factor every trinomial carries on its third monomial.
+// It is REAL, which is what lets assembleSym conjugate U + u.W in one go: conj(u.W) = u.conj(W).
+func rootNorm(eval *ckks.Evaluator, ct *rlwe.Ciphertext, W rlwe.Scale) (*rlwe.Ciphertext, error) {
+	cj := ct.CopyNew()
+	if err := eval.Conjugate(cj, cj); err != nil {
+		return nil, fmt.Errorf("rootNorm Conjugate: %w", err)
+	}
+	out := ct.CopyNew()
+	if err := eval.MulRelin(out, cj, out); err != nil {
+		return nil, fmt.Errorf("rootNorm MulRelin: %w", err)
+	}
+	if err := eval.RescaleTo(out, W, out); err != nil {
+		return nil, fmt.Errorf("rootNorm RescaleTo: %w", err)
+	}
+	return out, nil
+}
+
+// assembleSym builds h = F0 + T + conj(T) with T = U + u.W: one conjugation for the whole thing,
+// since u is real.
+func assembleSym(eval *ckks.Evaluator, f0 complex128, ctU, ctW, u *rlwe.Ciphertext, W rlwe.Scale) (*rlwe.Ciphertext, error) {
+	t, err := mulByNorm(eval, ctW, u, W)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		t = ctU
+	} else if ctU != nil {
+		if err = checkScale("assembleSym U vs u.W", t.Scale, ctU.Scale); err != nil {
+			return nil, err
 		}
-		Yi := pb.Value[stride*i]
-		if Yi == nil {
-			return psNode{}, fmt.Errorf("babyStepEval: baby X^%d missing from pb", stride*i)
-		}
-		term := Yi.CopyNew()
-		if err := eval.Mul(term, c[i], term); err != nil {
-			return psNode{}, fmt.Errorf("baby Mul: %w", err)
-		}
-		if err := eval.RescaleTo(term, W, term); err != nil {
-			return psNode{}, fmt.Errorf("baby RescaleTo: %w", err)
-		}
-		if acc == nil {
-			acc = term
-		} else {
-			utils.AlignLevels(eval, acc, term)
-			if err := eval.Add(acc, term, acc); err != nil {
-				return psNode{}, fmt.Errorf("baby Add: %w", err)
-			}
+		t.Scale = ctU.Scale
+		if err = eval.Add(t, ctU, t); err != nil {
+			return nil, fmt.Errorf("assembleSym U + u.W: %w", err)
 		}
 	}
-	if acc == nil {
-		return psNode{ct: nil, cst: c[0]}, nil
+	if t == nil {
+		return nil, fmt.Errorf("assembleSym: h has no non-constant term")
 	}
-	if c[0] != 0 {
-		if err := eval.Add(acc, c[0], acc); err != nil {
-			return psNode{}, fmt.Errorf("baby Add const: %w", err)
-		}
+	return realFold(eval, f0, t)
+}
+
+// realFold returns f0 + 2.Re(ct). Conjugation is a key switch, moving neither scale nor level, so
+// the addition is exact.
+func realFold(eval *ckks.Evaluator, f0 complex128, ct *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+	out := ct.CopyNew()
+	cj := ct.CopyNew()
+	if err := eval.Conjugate(cj, cj); err != nil {
+		return nil, fmt.Errorf("realFold Conjugate: %w", err)
 	}
-	return psNode{ct: acc}, nil
+	if err := eval.Add(out, cj, out); err != nil {
+		return nil, fmt.Errorf("realFold Add conj: %w", err)
+	}
+	if err := eval.Add(out, f0, out); err != nil {
+		return nil, fmt.Errorf("realFold Add f0: %w", err)
+	}
+	return out, nil
+}
+
+// mulByNorm returns u.ct, or nil when ct is nil.
+func mulByNorm(eval *ckks.Evaluator, ct, u *rlwe.Ciphertext, W rlwe.Scale) (*rlwe.Ciphertext, error) {
+	if ct == nil {
+		return nil, nil
+	}
+	out := ct.CopyNew()
+	un := u.CopyNew()
+	utils.AlignLevels(eval, out, un)
+	if err := eval.MulRelin(out, un, out); err != nil {
+		return nil, fmt.Errorf("mulByNorm MulRelin: %w", err)
+	}
+	if err := eval.RescaleTo(out, W, out); err != nil {
+		return nil, fmt.Errorf("mulByNorm RescaleTo: %w", err)
+	}
+	return out, nil
 }

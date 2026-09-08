@@ -37,7 +37,7 @@ func SmootherCleaning(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Cip
 	return out, nil
 }
 
-// SmootherCleaning refines a bit via p(x) = -20x^7+70x^6-84x^5+35x^4
+// VerySmootherCleaning refines a bit via p(x) = -20x^7+70x^6-84x^5+35x^4
 // consuming ceil(log2(deg+1)) = 3 levels.
 func VerySmootherCleaning(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
 	poly := bignum.NewPolynomial(bignum.Monomial, []complex128{0, 0, 0, 0, 35, -84, 70, -20}, nil)
