@@ -24,6 +24,7 @@ var (
 	xorFlag     = flag.String("xor", "nosq", `XOR circuit used throughout: "nosq" for x+y-2xy, "sq" for (x-y)^2`)
 	cleanFlag   = flag.String("clean", "cleaning", `cleaning polynomial: "cleaning" (2 levels), "smoother" or "verysmoother" (3 levels, one prime more)`)
 	placeFlag   = flag.String("place", "after", `where the round cleaning lands: "after" (AddRoundKey then Cleaning), "both" (clean state and key, then XOR) or "one" (clean the state only, then XOR)`)
+	xtractFlag  = flag.Bool("cleanextract", false, "run the refresh on BitExtractClean (interpolation and cleaning fused, error quadratic in Algo1's output) instead of BitExtract (half spectrum, error linear); costs one prime more")
 	seedFlag    = flag.Int64("seed", 0, "seed of the block draw; 0 draws one from the clock")
 )
 
@@ -52,7 +53,15 @@ func config(t *testing.T) Config {
 	if err != nil {
 		t.Fatalf("-place: %v", err)
 	}
-	return Config{Xor: xk, Clean: ck, Place: pk}
+	return Config{Xor: xk, Clean: ck, Place: pk, CleanExtract: *xtractFlag}
+}
+
+// extractName is what the trace calls the extraction the config selected.
+func extractName(cfg Config) string {
+	if cfg.CleanExtract {
+		return "clean (interp+cleaning, k+1 lv)"
+	}
+	return "half (demi-spectre, k lv)"
 }
 
 // tail names the steps that close a round, which every placement but "after" merges into one
@@ -74,8 +83,8 @@ func TestTransciphering(t *testing.T) {
 		n = 1
 	}
 	cfg := config(t)
-	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d, XOR=%s, clean=%s, place=%s \n",
-		n, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place)
+	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s \n",
+		n, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg))
 
 	ctx, err := NewContextWith(logN, k, cfg)
 	if err != nil {
@@ -197,8 +206,13 @@ func TestAES(t *testing.T) {
 
 	seed := blockSeed()
 	blocks := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
-	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, XOR=%s, clean=%s, place=%s, %d blocks, random seed = %d \n",
-		nMiddle, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, len(blocks), seed)
+	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, %d blocks, random seed = %d \n",
+		nMiddle, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), len(blocks), seed)
+
+	rec, err := newAESCSV(*csvFlag, ctx, cfg, logN, k, len(blocks), nMiddle, seed)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 
 	// The blocks stay in the CLEAR: that is what the client sends and what FirstRound takes.
 	states := make([][16]byte, len(blocks))
@@ -222,14 +236,15 @@ func TestAES(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FirstRound: %v", err)
 	}
-	times["FirstRound"] = append(times["FirstRound"], time.Since(t0))
+	dFirst := time.Since(t0)
+	times["FirstRound"] = append(times["FirstRound"], dFirst)
 	for bi := range states {
 		aes.AddRoundKey(states[bi][:], rk[0])
 	}
 	if l := st[0][0].Level(); l != SubBytesLevel {
 		t.Errorf("FirstRound left the state at level %d, want SubBytesLevel %d", l, SubBytesLevel)
 	}
-	report(ctx, st, states, 0, "FirstRound")
+	rec.add(0, "FirstRound", dFirst, report(ctx, st, states, 0, "FirstRound"))
 
 	// round and rkNow name the round in flight, so the same hook serves the middle rounds and the
 	// last one. Refresh advances the oracle by ShiftRows: the bootstrap keeps the bit values, only
@@ -250,7 +265,7 @@ func TestAES(t *testing.T) {
 				aes.AddRoundKey(states[bi][:], rkNow)
 			}
 		}
-		report(ctx, st, states, round, name)
+		rec.add(round, name, dur, report(ctx, st, states, round, name))
 	}
 
 	for r := 1; r <= nMiddle; r++ {
@@ -299,6 +314,10 @@ func TestAES(t *testing.T) {
 	} else {
 		fmt.Printf("\n=== OK: full AES-128, all %d blocks conform to the row-major AES oracle ===\n", len(states))
 	}
+
+	if err := rec.write(); err != nil {
+		t.Errorf("%v", err)
+	}
 }
 
 // encRK packs a round key at the given level: the key stream is shared, so the 16 bytes are
@@ -332,7 +351,17 @@ func cmp16(got, want [16]byte) (wrong, first int) {
 
 // report prints the slot + chain of st[0][0], the precision pooled over the 64 ciphertexts, and the
 // whole batch against the oracle.
-func report(ctx *Context, st blockpack.Packed, states [][16]byte, round int, step string) {
+// precSummary is what report measured, so a caller can write it out instead of only reading it.
+type precSummary struct {
+	AvgPrec  float64 // mean precision in bits, pooled over the 64 ciphertexts and all their slots
+	WorstBit float64 // largest |value - reference| over the same pool, i.e. the MINIMUM precision
+	Slots    int     // how many values that pool holds
+	Level    int
+	Wrong    int     // blocks the oracle disagrees with
+	BitErr   float64 // worst distance to a clean bit, from blockpack.Decrypt
+}
+
+func report(ctx *Context, st blockpack.Packed, states [][16]byte, round int, step string) precSummary {
 	ciP := ctx.Sw.CiP
 	debug.DbgSlotCI(fmt.Sprintf("T%d %-11s st[0][0] =", round, step), st[0][0])
 	debug.DbgChain(fmt.Sprintf("T%d %-11s chain    :", round, step), ctx.Sw.EvalCI, st[0][0])
@@ -349,11 +378,27 @@ func report(ctx *Context, st blockpack.Packed, states [][16]byte, round int, ste
 	}
 	debug.PrecPoolCI(fmt.Sprintf("T%d %-11s prec (128 bits) :", round, step), entries...)
 
+	// The same pool again, kept this time: one avg and one worst over ALL 64 ciphertexts and all
+	// their slots, not per byte.
+	sum := precSummary{Level: st[0][0].Level()}
+	stats := make([]utils.BitStats, 0, len(entries))
+	for _, e := range entries {
+		st, err := utils.BitDistanceCt(ctx.EcdCI, ctx.DecCI, e.Ct, e.Want, 0)
+		if err != nil {
+			fmt.Printf("  [T%d] %-11s prec: %v\n", round, step, err)
+			return sum
+		}
+		stats = append(stats, st)
+	}
+	agg, _ := utils.WorstOf(stats)
+	sum.AvgPrec, sum.WorstBit, sum.Slots = agg.AvgPrec, agg.Worst, agg.Slots
+
 	got, bitErr, err := blockpack.Decrypt(ciP, ctx.EcdCI, ctx.DecCI, st)
 	if err != nil {
 		fmt.Printf("  [T%d] %-11s ORACLE: decrypt error: %v\n", round, step, err)
-		return
+		return sum
 	}
+	sum.BitErr = bitErr
 	wrong, firstBad := 0, -1
 	for bi := range states {
 		if got[bi] != states[bi] {
@@ -363,11 +408,13 @@ func report(ctx *Context, st blockpack.Packed, states [][16]byte, round int, ste
 			}
 		}
 	}
+	sum.Wrong = wrong
 	if wrong == 0 {
 		fmt.Printf("  [T%d] %-11s ORACLE: TRUE all %d blocks (worst bit err %.4f)\n", round, step, len(states), bitErr)
-		return
+		return sum
 	}
 	w, f := cmp16(got[firstBad], states[firstBad])
 	fmt.Printf("  [T%d] %-11s ORACLE: FALSE %d/%d blocks wrong (worst bit err %.4f; first bad block %d: %d/16 bytes, first byte %d)\n            got =%x\n            want=%x\n",
 		round, step, wrong, len(states), bitErr, firstBad, w, f, got[firstBad], states[firstBad])
+	return sum
 }

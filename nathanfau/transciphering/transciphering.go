@@ -65,6 +65,30 @@ type Config struct {
 	Xor   aes.XorKind
 	Clean cleaning.Kind
 	Place cleaning.Placement
+
+	// CleanExtract runs the refresh on bitbatching.BitExtractClean instead of BitExtract: the
+	// interpolation and the cleaning fused into one bivariate polynomial, so the bits come back
+	// cleaned. One prime more on the chain, and an error quadratic in Algo1's output instead of
+	// linear. Like Clean, it is baked into the parameters and cannot be flipped later.
+	CleanExtract bool
+}
+
+// Extract is the extraction Cfg selects. Both have the same signature, the same output order and
+// the same normalised scale and level, so the refresh does not care which one it holds.
+func (c Config) Extract() func(ckks.Parameters, *ckks.Evaluator, *rlwe.Ciphertext, int) ([]*rlwe.Ciphertext, error) {
+	if c.CleanExtract {
+		return bitbatching.BitExtractClean
+	}
+	return bitbatching.BitExtract
+}
+
+// ExtractLevels is how many primes that extraction spends, which the chain has to carry above the
+// refresh.
+func (c Config) ExtractLevels(k int) int {
+	if c.CleanExtract {
+		return k + 1
+	}
+	return k
 }
 
 const (
@@ -93,7 +117,7 @@ func NewContext(logN, k int) (*Context, error) {
 // depth, so RefreshLv and ARKLv follow it.
 func NewContextWith(logN, k int, cfg Config) (*Context, error) {
 	depth := cfg.Clean.Depth()
-	params, btpParams, err := params2.TranscipheringParamsDepth(logN, k, depth)
+	params, btpParams, err := params2.TranscipheringParamsDepth(logN, k, depth, cfg.ExtractLevels(k))
 	if err != nil {
 		return nil, fmt.Errorf("TranscipheringParams: %w", err)
 	}
@@ -238,24 +262,25 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 		}
 	}
 
-	// 6. BitExtract each nibble, CombineReIm (real byte + i*imag byte), Std -> CI, canonical scale.
+	// 6. Extract each nibble, CombineReIm (real byte + i*imag byte), Std -> CI, canonical scale.
+	extract := c.Cfg.Extract()
 	var out blockpack.Packed
 	for j := 0; j < 8; j++ {
-		aLo, err := bitbatching.BitExtract(c.Params, ck, re[2*j], c.K)
+		aLo, err := extract(c.Params, ck, re[2*j], c.K)
 		if err != nil {
-			return blockpack.Packed{}, fmt.Errorf("refresh BitExtract re low j=%d: %w", j, err)
+			return blockpack.Packed{}, fmt.Errorf("refresh extract re low j=%d: %w", j, err)
 		}
-		aHi, err := bitbatching.BitExtract(c.Params, ck, re[2*j+1], c.K)
+		aHi, err := extract(c.Params, ck, re[2*j+1], c.K)
 		if err != nil {
-			return blockpack.Packed{}, fmt.Errorf("refresh BitExtract re high j=%d: %w", j, err)
+			return blockpack.Packed{}, fmt.Errorf("refresh extract re high j=%d: %w", j, err)
 		}
-		bLo, err := bitbatching.BitExtract(c.Params, ck, im[2*j], c.K)
+		bLo, err := extract(c.Params, ck, im[2*j], c.K)
 		if err != nil {
-			return blockpack.Packed{}, fmt.Errorf("refresh BitExtract im low j=%d: %w", j, err)
+			return blockpack.Packed{}, fmt.Errorf("refresh extract im low j=%d: %w", j, err)
 		}
-		bHi, err := bitbatching.BitExtract(c.Params, ck, im[2*j+1], c.K)
+		bHi, err := extract(c.Params, ck, im[2*j+1], c.K)
 		if err != nil {
-			return blockpack.Packed{}, fmt.Errorf("refresh BitExtract im high j=%d: %w", j, err)
+			return blockpack.Packed{}, fmt.Errorf("refresh extract im high j=%d: %w", j, err)
 		}
 		aBits := append(append([]*rlwe.Ciphertext{}, aLo...), aHi...) // 8 bits of the real byte
 		bBits := append(append([]*rlwe.Ciphertext{}, bLo...), bHi...) // 8 bits of the imag byte

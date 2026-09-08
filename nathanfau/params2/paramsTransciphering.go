@@ -39,17 +39,24 @@ func ciThenStd(logN int, logQ, logP []int, logScale int) (ckks.Parameters, error
 }
 
 // TranscipheringParams is TranscipheringParamsDepth at the default cleaning depth, 2 levels, i.e.
-// cleaning.Cleaning. It must stay in step with transciphering.DefaultCleanDepth, which cannot be
-// imported here: transciphering already depends on this package.
+// cleaning.Cleaning, and the default extraction, bitbatching.BitExtract at k levels. It must stay in
+// step with transciphering.DefaultCleanDepth, which cannot be imported here: transciphering already
+// depends on this package.
 func TranscipheringParams(logN, k int) (ckks.Parameters, bootstrapping.Parameters, error) {
-	return TranscipheringParamsDepth(logN, k, 2)
+	return TranscipheringParamsDepth(logN, k, 2, k)
 }
 
 // TranscipheringParamsDepth is the Algo1 pipeline parameter set (the leveled AES round + Algo1
 // refresh of nathanfau/transciphering): MessageRatio = 2^k so q0 = base + k = 42 at k = 4, K = t=2^k.
-func TranscipheringParamsDepth(logN, k, cleanDepth int) (ckks.Parameters, bootstrapping.Parameters, error) {
+//
+// extractLv is how many primes the bit extraction spends: k for bitbatching.BitExtract, k+1 for
+// BitExtractClean. It sits above the refresh, so it lengthens the chain without moving RefreshLevel.
+func TranscipheringParamsDepth(logN, k, cleanDepth, extractLv int) (ckks.Parameters, bootstrapping.Parameters, error) {
 	if cleanDepth < 2 || cleanDepth > 3 {
 		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("cleanDepth %d, want 2 or 3", cleanDepth)
+	}
+	if extractLv < k || extractLv > k+1 {
+		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("extractLv %d, want %d or %d", extractLv, k, k+1)
 	}
 	logQ := []int{42}
 	logQ = append(logQ, 60)         // SlotsToCoeffs
@@ -61,8 +68,10 @@ func TranscipheringParamsDepth(logN, k, cleanDepth int) (ckks.Parameters, bootst
 	logQ = append(logQ, 38)         // AddRoundKey
 	logQ = append(logQ, 38, 38, 38) // MixColumns
 	// refresh
-	logQ = append(logQ, 38)                 // Conv_{Cplx->Real}
-	logQ = append(logQ, 38, 38, 38, 38, 38) // 5 levels for BitExtract
+	logQ = append(logQ, 38) // Conv_{Cplx->Real}
+	for i := 0; i < extractLv; i++ {
+		logQ = append(logQ, 38) // bit extraction
+	}
 	logQ = append(logQ, 38, 38, 38)         // 3 levels for squaring
 	logQ = append(logQ, 38)                 // extractExp
 	logQ = append(logQ, 38)                 // Conv_{Real->Cplx}
