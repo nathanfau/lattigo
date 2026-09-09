@@ -36,6 +36,9 @@ INK = "#0b0b0b"
 INK_MUTED = "#52514e"
 GRID = "#e3e2df"
 
+# L'axe des ordonnées ne descend pas plus bas, quoi que fassent les données : voir set_ylim.
+FLOOR = -5.0
+
 # Ce qui définit une CONFIGURATION. `seed` en est exclue : sans -seed elle est tirée de l'horloge,
 # donc elle diffère à chaque run sans que rien de la configuration n'ait changé. Le label de légende
 # est construit sur les colonnes qui DIFFÈRENT entre les configurations retenues.
@@ -115,13 +118,6 @@ def draw(df, args, where):
         sys.exit(f"{len(runs)} runs pour {len(SERIES)} couleurs : filtre le fichier, "
                  "une 9e couleur ne serait plus distinguable")
 
-    # Sous 0 bit l'erreur dépasse 1 : le bit n'existe plus, et de COMBIEN il n'existe plus ne veut
-    # rien dire. Un run mort qui plonge à -110 écraserait tous les autres dans une bande illisible,
-    # donc on plafonne à 0 -- au TRACÉ seulement, le CSV garde les valeurs réelles. Le plancher est
-    # annoncé sous l'axe : une courbe collée à 0 est morte, pas juste mauvaise.
-    clamped = int((df.prec_min < 0).sum() + (args.avg and (df.prec_avg < 0).sum()))
-    df = df.assign(prec_min=df.prec_min.clip(lower=0), prec_avg=df.prec_avg.clip(lower=0))
-
     full, short = run_labels(df)
     fig, ax = plt.subplots(figsize=(11, 5.8), facecolor=SURFACE)
     ax.set_facecolor(SURFACE)
@@ -162,10 +158,14 @@ def draw(df, args, where):
         ax.spines[side].set_color(GRID)
     ax.tick_params(colors=INK_MUTED, labelsize=8.5)
 
-    ax.set_ylim(bottom=min(0, df.prec_min.min()) - 0.5)
-    if clamped:
-        ax.annotate("une courbe collée à 0 est passée sous 0 bit : l'erreur y dépasse 1, "
-                    "le bit n'existe plus — le CSV garde la valeur réelle",
+    # Les valeurs sont tracées telles quelles, mais l'axe ne descend pas sous FLOOR : sous 0 bit
+    # l'erreur dépasse 1, le bit n'existe plus, et de COMBIEN il n'existe plus ne veut rien dire.
+    # Un run qui plonge à -110 écraserait tous les autres dans une bande illisible.
+    lo = float(min(df.prec_min.min(), df.prec_avg.min() if args.avg else 0))
+    ax.set_ylim(bottom=max(FLOOR, lo - 0.5))
+    if lo < FLOOR:
+        ax.annotate(f"une courbe qui sort par le bas est passée sous {FLOOR:.0f} bits : "
+                    "l'erreur y dépasse 1 depuis longtemps, le bit n'existe plus",
                     xy=(0, -0.13), xycoords="axes fraction",
                     color=INK_MUTED, fontsize=8, ha="left", va="top")
 
@@ -176,6 +176,7 @@ def draw(df, args, where):
     placed = None
     for y, x, color, tag in sorted(ends):
         ax.plot([x], [y], marker="o", ms=5, color=color, zorder=4)
+        y = max(y0, min(y1, y))  # une courbe finie hors cadre garde son etiquette sur le bord
         if placed is not None and y - placed < gap:
             y = placed + gap
         placed = y
