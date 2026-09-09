@@ -4,16 +4,14 @@
 //	CI  (deg N, N real slots)      : [x_0 .. x_{N/2-1}, y_0 .. y_{N/2-1}]
 //	Std (deg N, N/2 complex slots) : [z_0 .. z_{N/2-1}]   with z_j = x_j + i*y_j
 //
-// The first half of the CI real slots hold the real parts, the second half the imaginary
-// parts. An intermediate Std ring of degree 2N (N complex slots) bridges the two:
-// RealToComplex/ComplexToReal cross CI <-> Std-deg-2N, and ApplyEvaluationKey changes the
-// degree 2N <-> N.
+// The first half of the CI real slots hold the real parts, the second half the imaginary parts
 package convctx
 
 import (
 	"fmt"
 
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
@@ -25,7 +23,7 @@ type CtxSwitcher struct {
 	StdSmallP ckks.Parameters
 
 	SkCI    *rlwe.SecretKey
-	SkBig   *rlwe.SecretKey
+	SkBig   *rlwe.SecretKey // iota(SkSmall), not an independent key
 	SkSmall *rlwe.SecretKey
 
 	nHalf int
@@ -33,19 +31,26 @@ type CtxSwitcher struct {
 	EvalCI *ckks.Evaluator
 	eval   *ckks.Evaluator
 
-	sw ckks.DomainSwitcher
+	sw         ckks.DomainSwitcher
+	evkStdToCI *rlwe.EvaluationKey // iota(s) -> s~; the other way round, sw.RealToComplex holds it
 
-	evkBigToSmall *rlwe.EvaluationKey // 2N -> N projection
-	evkSmallToBig *rlwe.EvaluationKey // N -> 2N embedding
+	stdRingQ *ring.Ring // deg 2N, standard
+	ciRingQ  *ring.Ring // deg N, conjugate invariant
 
-	ptMask1 *rlwe.Plaintext // [1.., i..]
-	ptMask2 *rlwe.Plaintext // [1/2.., -i/2..]
+	autRot  []uint64 // sigma_{2N+1}, the N/2-slot rotation, as a coefficient permutation
+	autConj []uint64 // sigma_{-1}, the conjugation, as a coefficient permutation
+
+	// One mask per level, encoded at that level's rescaling factor so a conversion does not move
+	// the scale. Built on demand by maskAt.
+	ecdBig  *ckks.Encoder
+	ptMask1 map[int]*rlwe.Plaintext // [1.., i..]
+	ptMask2 map[int]*rlwe.Plaintext // [1.., -i..]
 }
 
 // NewCtxSwitcher builds the machinery around a Std deg-N ring (typically the bootstrapping
 // ring) and its secret key skSmall, so that ciphertexts of that ring (e.g. the output of
 // CoeffsToSlots) are directly convertible. The CI deg-N ring and the Std deg-2N working ring
-// are derived from the same literal (same moduli Q, P); their secrets are generated here.
+// are derived from the same literal (same moduli Q, P); the CI secret is generated here.
 func NewCtxSwitcher(stdSmallP ckks.Parameters, skSmall *rlwe.SecretKey) (*CtxSwitcher, error) {
 
 	c := &CtxSwitcher{StdSmallP: stdSmallP, SkSmall: skSmall}
@@ -67,97 +72,127 @@ func NewCtxSwitcher(stdSmallP ckks.Parameters, skSmall *rlwe.SecretKey) (*CtxSwi
 	c.nHalf = c.StdBigP.MaxSlots() / 2
 
 	kgenBig := rlwe.NewKeyGenerator(c.StdBigP)
-	c.SkBig = kgenBig.GenSecretKeyNew()
+
+	// SkBig = iota(SkSmall). MapSmallDimensionToLargerDimensionNTT is lattigo's iota in the NTT
+	// domain -- GenEvaluationKey uses it to embed the smaller of two keys -- and the P part is
+	// rebuilt from Q the way GenEvaluationKeysForRingSwapNew does.
+	c.SkBig = rlwe.NewSecretKey(c.StdBigP)
+	ring.MapSmallDimensionToLargerDimensionNTT(skSmall.Value.Q, c.SkBig.Value.Q)
+	if c.StdBigP.PCount() != 0 {
+		buffQ := c.StdBigP.RingQ().NewPoly()
+		rlwe.ExtendBasisSmallNormAndCenterNTTMontgomery(c.StdBigP.RingQ(), c.StdBigP.RingP(), c.SkBig.Value.Q, buffQ, c.SkBig.Value.P)
+	}
+
 	c.SkCI = rlwe.NewKeyGenerator(c.CiP).GenSecretKeyNew()
 
+	// The only two key-switching keys of the package: s~ -> iota(s), which the DomainSwitcher uses
+	// in RealToComplex, and iota(s) -> s~, which StandardToCI applies itself because it has to
+	// place it before the masking.
 	evkC2R, evkR2C := kgenBig.GenEvaluationKeysForRingSwapNew(c.SkBig, c.SkCI)
+	c.evkStdToCI = evkC2R
 	if c.sw, err = ckks.NewDomainSwitcher(c.StdBigP, evkC2R, evkR2C); err != nil {
 		return nil, fmt.Errorf("NewDomainSwitcher: %w", err)
 	}
 
-	c.evkBigToSmall = kgenBig.GenEvaluationKeyNew(c.SkBig, c.SkSmall)
-	c.evkSmallToBig = kgenBig.GenEvaluationKeyNew(c.SkSmall, c.SkBig)
+	// The two automorphisms, as coefficient permutations rather than as key switches.
+	// GaloisElement(N/2) = 5^{N/2} mod 4N = 2N+1, the sigma of Fig. 1.
+	c.stdRingQ = c.StdBigP.RingQ()
+	if c.ciRingQ, err = c.stdRingQ.ConjugateInvariantRing(); err != nil {
+		return nil, fmt.Errorf("ConjugateInvariantRing: %w", err)
+	}
+	if c.autRot, err = ring.AutomorphismNTTIndex(c.stdRingQ.N(), c.stdRingQ.NthRoot(), c.StdBigP.GaloisElement(c.nHalf)); err != nil {
+		return nil, fmt.Errorf("AutomorphismNTTIndex rot: %w", err)
+	}
+	if c.autConj, err = ring.AutomorphismNTTIndex(c.stdRingQ.N(), c.stdRingQ.NthRoot(), c.stdRingQ.NthRoot()-1); err != nil {
+		return nil, fmt.Errorf("AutomorphismNTTIndex conj: %w", err)
+	}
 
-	galRot := kgenBig.GenGaloisKeyNew(c.StdBigP.GaloisElement(c.nHalf), c.SkBig)
-	galConj := kgenBig.GenGaloisKeyNew(c.StdBigP.GaloisElementOrderTwoOrthogonalSubgroup(), c.SkBig)
-	evkSet := rlwe.NewMemEvaluationKeySet(nil, galRot, galConj)
-
-	c.eval = ckks.NewEvaluator(c.StdBigP, evkSet)
+	c.eval = ckks.NewEvaluator(c.StdBigP, nil)
 
 	rlkCI := rlwe.NewKeyGenerator(c.CiP).GenRelinearizationKeyNew(c.SkCI)
 	c.EvalCI = ckks.NewEvaluator(c.CiP, rlwe.NewMemEvaluationKeySet(rlkCI))
 
-	N := c.StdBigP.MaxSlots()
-	half := N / 2
-	ecdBig := ckks.NewEncoder(c.StdBigP)
-
-	m1 := make([]complex128, N)
-	for i := 0; i < half; i++ {
-		m1[i] = 1
-	}
-	for i := half; i < N; i++ {
-		m1[i] = 1i
-	}
-	c.ptMask1 = ckks.NewPlaintext(c.StdBigP, c.StdBigP.MaxLevel())
-	if err = ecdBig.Encode(m1, c.ptMask1); err != nil {
-		return nil, fmt.Errorf("encode mask1: %w", err)
-	}
-
-	m2 := make([]complex128, N)
-	for i := 0; i < half; i++ {
-		m2[i] = 0.5
-	}
-	for i := half; i < N; i++ {
-		m2[i] = -0.5i
-	}
-	c.ptMask2 = ckks.NewPlaintext(c.StdBigP, c.StdBigP.MaxLevel())
-
-	/*
-
-
-		FLAG
-
-
-	*/
-	// Compensate the folding factor 2: ComplexToReal (FoldStandardToConjugateInvariant)
-	// cost = ~ 1 bit of precision
-	// need to analyse this further
-	c.ptMask2.Scale = c.ptMask2.Scale.Div(rlwe.NewScale(2))
-	if err = ecdBig.Encode(m2, c.ptMask2); err != nil {
-		return nil, fmt.Errorf("encode mask2: %w", err)
-	}
+	c.ecdBig = ckks.NewEncoder(c.StdBigP)
+	c.ptMask1 = map[int]*rlwe.Plaintext{}
+	c.ptMask2 = map[int]*rlwe.Plaintext{}
 
 	return c, nil
 }
 
+// maskAt returns the mask of Fig. 1 step (2), or of Fig. 2 step (3) when second, for a ciphertext
+// at level lvl.
+func (c *CtxSwitcher) maskAt(lvl int, second bool) (*rlwe.Plaintext, error) {
+
+	cache := c.ptMask1
+	if second {
+		cache = c.ptMask2
+	}
+	if pt, ok := cache[lvl]; ok {
+		return pt, nil
+	}
+
+	N := c.StdBigP.MaxSlots()
+	half := N / 2
+	m := make([]complex128, N)
+	for i := 0; i < half; i++ {
+		m[i] = 1
+	}
+	v := 1i
+	if second {
+		v = -1i
+	}
+	for i := half; i < N; i++ {
+		m[i] = v
+	}
+
+	// At what Rescale will divide by, so the conversion does not move the scale.
+	scale := utils.RescalingFactor(c.StdBigP, lvl)
+	if second {
+		scale = scale.Div(rlwe.NewScale(2))
+	}
+
+	pt := ckks.NewPlaintext(c.StdBigP, lvl)
+	pt.Scale = scale
+	if err := c.ecdBig.Encode(m, pt); err != nil {
+		return nil, fmt.Errorf("encode mask (second=%t) at level %d: %w", second, lvl, err)
+	}
+	cache[lvl] = pt
+	return pt, nil
+}
+
 // CIToStandard is Fig. 1
 func (c *CtxSwitcher) CIToStandard(ctCI *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+
+	if ctCI.Level() < 1 {
+		return nil, fmt.Errorf("CIToStandard: input at level %d, the masking needs a prime to rescale", ctCI.Level())
+	}
 
 	ctBig := ckks.NewCiphertext(c.StdBigP, 1, ctCI.Level())
 	if err := c.sw.RealToComplex(c.eval, ctCI, ctBig); err != nil {
 		return nil, fmt.Errorf("RealToComplex: %w", err)
 	}
 
-	if err := c.eval.Mul(ctBig, c.ptMask1, ctBig); err != nil {
+	pt, err := c.maskAt(ctBig.Level(), false)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.eval.Mul(ctBig, pt, ctBig); err != nil {
 		return nil, fmt.Errorf("mul mask1: %w", err)
 	}
 	if err := c.eval.Rescale(ctBig, ctBig); err != nil {
 		return nil, fmt.Errorf("rescale mask1: %w", err)
 	}
 
-	ctRot := ckks.NewCiphertext(c.StdBigP, 1, ctBig.Level())
-	if err := c.eval.Rotate(ctBig, c.nHalf, ctRot); err != nil {
-		return nil, fmt.Errorf("rotate: %w", err)
-	}
-	if err := c.eval.Add(ctBig, ctRot, ctBig); err != nil {
-		return nil, fmt.Errorf("add: %w", err)
-	}
-
-	ctSmall := ckks.NewCiphertext(c.StdSmallP, 1, ctBig.Level())
-	if err := c.eval.ApplyEvaluationKey(ctBig, c.evkBigToSmall, ctSmall); err != nil {
-		return nil, fmt.Errorf("project 2N->N: %w", err)
+	level := ctBig.Level()
+	ringQ := c.stdRingQ.AtLevel(level)
+	ctRot := ckks.NewCiphertext(c.StdBigP, 1, level)
+	for i := range ctBig.Value {
+		ringQ.AutomorphismNTTWithIndex(ctBig.Value[i], c.autRot, ctRot.Value[i])
+		ringQ.Add(ctBig.Value[i], ctRot.Value[i], ctBig.Value[i])
 	}
 
+	ctSmall := ckks.NewCiphertext(c.StdSmallP, 1, level)
+	rlwe.SwitchCiphertextRingDegreeNTT(ctBig.El(), ringQ, ctSmall.El())
 	ctSmall.LogDimensions = c.StdSmallP.LogMaxDimensions()
 	return ctSmall, nil
 }
@@ -165,32 +200,39 @@ func (c *CtxSwitcher) CIToStandard(ctCI *rlwe.Ciphertext) (*rlwe.Ciphertext, err
 // StandardToCI is Fig. 2
 func (c *CtxSwitcher) StandardToCI(ctStd *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
 
-	ctBig := ckks.NewCiphertext(c.StdBigP, 1, ctStd.Level())
-	if err := c.eval.ApplyEvaluationKey(ctStd, c.evkSmallToBig, ctBig); err != nil {
-		return nil, fmt.Errorf("embed N->2N: %w", err)
+	if ctStd.Level() < 1 {
+		return nil, fmt.Errorf("StandardToCI: input at level %d, the masking needs a prime to rescale", ctStd.Level())
 	}
+
+	ctBig := ckks.NewCiphertext(c.StdBigP, 1, ctStd.Level())
+	rlwe.SwitchCiphertextRingDegreeNTT(ctStd.El(), nil, ctBig.El())
 	ctBig.LogDimensions = c.StdBigP.LogMaxDimensions()
 
-	ctMasked := ckks.NewCiphertext(c.StdBigP, 1, ctBig.Level())
-	if err := c.eval.Mul(ctBig, c.ptMask2, ctMasked); err != nil {
+	if err := c.eval.ApplyEvaluationKey(ctBig, c.evkStdToCI, ctBig); err != nil {
+		return nil, fmt.Errorf("key switch iota(s) -> s~: %w", err)
+	}
+
+	pt, err := c.maskAt(ctBig.Level(), true)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.eval.Mul(ctBig, pt, ctBig); err != nil {
 		return nil, fmt.Errorf("mul mask2: %w", err)
 	}
-	if err := c.eval.Rescale(ctMasked, ctMasked); err != nil {
+	if err := c.eval.Rescale(ctBig, ctBig); err != nil {
 		return nil, fmt.Errorf("rescale mask2: %w", err)
 	}
 
-	ctConj := ckks.NewCiphertext(c.StdBigP, 1, ctMasked.Level())
-	if err := c.eval.Conjugate(ctMasked, ctConj); err != nil {
-		return nil, fmt.Errorf("conjugate: %w", err)
+	level := ctBig.Level()
+	ciRingQ := c.ciRingQ.AtLevel(level)
+	ctCI := ckks.NewCiphertext(c.CiP, 1, level)
+	for i := range ctBig.Value {
+		ciRingQ.FoldStandardToConjugateInvariant(ctBig.Value[i], c.autConj, ctCI.Value[i])
 	}
-	if err := c.eval.Add(ctMasked, ctConj, ctMasked); err != nil {
-		return nil, fmt.Errorf("add: %w", err)
-	}
+	*ctCI.MetaData = *ctBig.MetaData
+	ctCI.LogDimensions = c.CiP.LogMaxDimensions()
 
-	ctCI := ckks.NewCiphertext(c.CiP, 1, ctMasked.Level())
-	if err := c.sw.ComplexToReal(c.eval, ctMasked, ctCI); err != nil {
-		return nil, fmt.Errorf("ComplexToReal: %w", err)
-	}
-
+	// FLAG SCALE. The fold doubled the encoded value, so the scale doubles with it.
+	ctCI.Scale = ctBig.Scale.Mul(rlwe.NewScale(2))
 	return ctCI, nil
 }
