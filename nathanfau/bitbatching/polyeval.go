@@ -9,6 +9,7 @@ import (
 	ckkspoly "github.com/tuneinsight/lattigo/v6/circuits/ckks/polynomial"
 	commonpoly "github.com/tuneinsight/lattigo/v6/circuits/common/polynomial"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 	"github.com/tuneinsight/lattigo/v6/utils/bignum"
 )
@@ -136,7 +137,7 @@ func chop(p []complex128) []complex128 {
 }
 
 func qScale(params ckks.Parameters, lvl int) rlwe.Scale {
-	return rlwe.NewScale(params.Q()[lvl])
+	return utils.RescalingFactor(params, lvl)
 }
 
 // checkScale fails loudly when a ciphertext does not carry the scale the caller is about to assume

@@ -138,10 +138,20 @@ func NewContextWith(logN int, cfg Config) (*Context, error) {
 // encoding
 // ---------------------------------------------------------------------------------------------
 
-// Plaintext encodes a state at DefaultScale. The counter block is public, only the key is
-// encrypted, so the initial AddRoundKey is a ct x pt product.
+// Plaintext encodes a state at DefaultScale, which is what a ciphertext of this pipeline carries.
 func (c *Context) Plaintext(s [whaes.Bytes]byte, level int) (*rlwe.Plaintext, error) {
+	return c.plaintextAt(s, level, c.Params.DefaultScale())
+}
+
+// plaintextForMul encodes a state at the level's rescaling factor instead, so that multiplying a
+// ciphertext by it and rescaling leaves the scale exactly where it was. See utils.RescalingFactor.
+func (c *Context) plaintextForMul(s [whaes.Bytes]byte, level int) (*rlwe.Plaintext, error) {
+	return c.plaintextAt(s, level, utils.RescalingFactor(c.Params, level))
+}
+
+func (c *Context) plaintextAt(s [whaes.Bytes]byte, level int, scale rlwe.Scale) (*rlwe.Plaintext, error) {
 	pt := ckks.NewPlaintext(c.Params, level)
+	pt.Scale = scale
 	if err := c.Ctx.Encoder.Encode(blockpack.WHSlotVec(c.Slots, [][16]byte{s}), pt); err != nil {
 		return nil, fmt.Errorf("whtransciphering.Plaintext: %w", err)
 	}
@@ -323,7 +333,9 @@ func (c *Context) FirstRound(block [whaes.Bytes]byte, rk0 *rlwe.Ciphertext, afte
 		after = noStep
 	}
 
-	pt, err := c.Plaintext(block, rk0.Level())
+	// The counter block is public, so the initial AddRoundKey is a ct x pt product: the plaintext
+	// carries the level's rescaling factor, not DefaultScale, so the Rescale below is exact.
+	pt, err := c.plaintextForMul(block, rk0.Level())
 	if err != nil {
 		return nil, fmt.Errorf("FirstRound: %w", err)
 	}
