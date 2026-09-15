@@ -56,7 +56,7 @@ _testmain.go
 
 # archives locales (jamais poussées)
 nathanfau/_freexor/
-nathanfau/_scale33/
+nathanfau/_zone33/
 
 # sorties -v des runs de test, le sweep et le tee qui les produisent.
 # logging_test.go déclare le TestMain du paquet transciphering, il ne peut donc pas vivre

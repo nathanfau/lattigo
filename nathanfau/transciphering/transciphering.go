@@ -41,16 +41,9 @@ type Context struct {
 	EncCI *rlwe.Encryptor
 	DecCI *rlwe.Decryptor
 
-	K      int // bits packed per ciphertext (t = 2^K)
-	Target int // Algo1 input level (S2C LevelQ)
-
-	// Canon is the scale of the state in the AES circuit: where Refresh leaves it, and where the
-	// state and the round keys are encrypted. It is the zone's scale when there is one, the default
-	// scale otherwise.
-	Canon rlwe.Scale
-	// Zone is the scale of the zone (params2.Shape.LogZone), zero when the chain has none. With a
-	// zone, Refresh hops out of it onto algo1.EntryScale and Algo1 lands back on it.
-	Zone rlwe.Scale
+	K      int        // bits packed per ciphertext (t = 2^K)
+	Target int        // Algo1 input level (S2C LevelQ)
+	Canon  rlwe.Scale // canonical output scale after refresh
 
 	Cfg Config // the variants this context runs on
 
@@ -140,8 +133,7 @@ func NewContextWith(logN, k int, cfg Config) (*Context, error) {
 
 // NewContextWith2 is NewContextWith on a chosen parameter shape (see params2.Shape). P leaves Q
 // untouched and moves only the key-switching, where the SlotsToCoeffs block and q0 reshape the
-// chain itself, so the context's own levels follow them. A zone keeps the levels and moves the
-// scale instead: see Context.Zone.
+// chain itself, so the context's own levels follow them.
 func NewContextWith2(logN, k int, cfg Config, sh params2.Shape) (*Context, error) {
 	depth := cfg.Clean.Depth()
 	params, btpParams, err := params2.TranscipheringParamsWith(logN, k, depth, cfg.ExtractLevels(k), sh)
@@ -211,13 +203,6 @@ func NewContextWith2(logN, k int, cfg Config, sh params2.Shape) (*Context, error
 	c.ARKKeyLv = c.ARKLv - cfg.Place.YDrop(depth)
 	c.LastKeyLv = c.RefreshLv - cfg.Place.YDrop(depth)
 
-	// With a zone the state lives at its scale, so Canon follows it. Without one nothing hops, and
-	// the pipeline runs exactly as it did before zones existed.
-	if sh.HasZone() {
-		c.Zone = sh.ZoneScale()
-		c.Canon = c.Zone
-	}
-
 	// Debug decoding contexts: Std (residual) and CI (AES circuit).
 	debug.EncStd, debug.DecStd, debug.ParamsStd = ckks.NewEncoder(params), rlwe.NewDecryptor(params, sk), params
 	debug.EncCI, debug.DecCI, debug.ParamsCI = c.EcdCI, c.DecCI, sw.CiP
@@ -262,20 +247,10 @@ func (c *Context) SubBytes(st blockpack.Packed, version int) (blockpack.Packed, 
 	return out, nil
 }
 
-// zoneScaleTol is how close, in bits, Refresh's output must land on the zone's scale before it is
-// labelled with it: off by more, the label would change the value.
-const zoneScaleTol = 30
-
-// inZone reports whether the context runs a zone (see Context.Zone).
-func (c *Context) inZone() bool { return c.Zone.Value.Sign() != 0 }
-
-// Refresh refreshes the whole state and applies ShiftRows at the Algo1 pause. With a zone, the
-// conversion to Std is also the hop out of it, onto the scale Algo1 wants, and Algo1 lands back on
-// the zone's scale (algo1.ExtractTo).
+// Refresh refreshes the whole state and applies ShiftRows at the Algo1 pause
 func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 	eval := c.Eval
 	ck := eval.Evaluator
-	entry := algo1.EntryScale(eval)
 
 	// 1-2. BitPack the 4-bit nibbles in CI, then convert to Std
 	var packed [16]*rlwe.Ciphertext
@@ -289,11 +264,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			return blockpack.Packed{}, fmt.Errorf("refresh BitPack high g=%d: %w", g, err)
 		}
 		for i, ciNib := range [2]*rlwe.Ciphertext{lo, hi} {
-			out := ciNib.Scale // no zone: the conversion keeps the scale
-			if c.inZone() {
-				out = entry
-			}
-			s, err := c.Sw.CIToStandardTo(ciNib, out)
+			s, err := c.Sw.CIToStandard(ciNib)
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("refresh CIToStandard g=%d nibble %d: %w", g, i, err)
 			}
@@ -308,7 +279,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 		if d := packed[p].Level() - c.Target; d > 0 {
 			ck.DropLevel(packed[p], d)
 		}
-		rr, ii, err := algo1.ExtractTo(eval, c.Sw, packed[p], c.K, c.Zone)
+		rr, ii, err := algo1.Extract(eval, c.Sw, packed[p], c.K)
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh Extract packet %d: %w", p, err)
 		}
@@ -357,10 +328,6 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			ci, err := c.Sw.StandardToCI(z)
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("refresh StandardToCI j=%d beta=%d: %w", j, beta, err)
-			}
-			if c.inZone() && !ci.Scale.InDelta(c.Canon, zoneScaleTol) {
-				return blockpack.Packed{}, fmt.Errorf("refresh j=%d beta=%d: scale 2^%.6f is 2^-%.1f off the zone's 2^%.6f, want below 2^-%d",
-					j, beta, ci.Scale.Log2(), ci.Scale.Log2Delta(c.Canon), c.Canon.Log2(), zoneScaleTol)
 			}
 			ci.Scale = c.Canon
 			out[j][beta] = ci

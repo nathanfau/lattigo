@@ -5,13 +5,11 @@ package params2
 
 import (
 	"fmt"
-	"math"
 	"math/big"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/dft"
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/mod1"
-	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
@@ -67,13 +65,9 @@ func STCLevels(logSTC []int) []int {
 	return lv
 }
 
-// LogScale is the default scale of the pipeline, and the size of every prime of the chain but q0,
-// the SlotsToCoeffs block and the zone (Shape.LogZone).
+// LogScale is the default scale of the pipeline, and the size of every prime of the chain but q0
+// and the SlotsToCoeffs block.
 const LogScale = 38
-
-// DefaultLogZone is the zone's prime size when Shape.LogZone is left at zero: LogScale, i.e. no
-// zone at all, the chain the pipeline has always run on.
-const DefaultLogZone = LogScale
 
 // DefaultLogQ0 is the bottom prime. Lattigo couples it to the scale by q0 = LogScale + k for a
 // message ratio of 2^k; we drop the coupling and run at LogScale, ratio 1, the 1/t being carried by
@@ -86,35 +80,14 @@ type Shape struct {
 	LogSTC []int // sizes of the SlotsToCoeffs primes, one level each; nil = DefaultLogSTC
 	LogQ0  int   // size of the bottom prime; 0 = DefaultLogQ0. The message ratio follows it:
 	// LogMessageRatio = LogQ0 - LogScale, so 42 gives 2^4 and 38 gives 1.
-
-	// LogZone is the size of the primes from Conv_{Real->Cplx} up to the bit extraction, i.e. the
-	// AES circuit and the bottom of the refresh; 0 = DefaultLogZone. Those stages multiply
-	// ciphertexts together, so the scale they run at must be the size of their primes: LogZone is
-	// both, and ZoneScale is that scale. The bootstrap above and below keeps LogScale.
-	LogZone int
 }
-
-// logZone is LogZone with its zero resolved.
-func (sh Shape) logZone() int {
-	if sh.LogZone == 0 {
-		return DefaultLogZone
-	}
-	return sh.LogZone
-}
-
-// HasZone reports whether sh runs a zone, i.e. primes of another size than LogScale.
-func (sh Shape) HasZone() bool { return sh.logZone() != DefaultLogZone }
-
-// ZoneScale is the scale a ciphertext must carry inside the zone sh describes: 2^LogZone, which
-// is the pipeline's own default scale when there is no zone.
-func (sh Shape) ZoneScale() rlwe.Scale { return rlwe.NewScale(math.Exp2(float64(sh.logZone()))) }
 
 // TranscipheringParamsWith is the Algo1 pipeline parameter set (nathanfau/transciphering) on a
 // fully specified shape, sh's zero fields meaning the pipeline's own. cleanDepth is the cleaning
 // polynomial's depth and extractLv the bit extraction's, k or k+1; both lengthen the chain above
 // the circuit, where a longer SlotsToCoeffs lengthens it below and shifts every level up.
 func TranscipheringParamsWith(logN, k, cleanDepth, extractLv int, sh Shape) (ckks.Parameters, bootstrapping.Parameters, error) {
-	logP, logSTC, logQ0, zone := sh.LogP, sh.LogSTC, sh.LogQ0, sh.logZone()
+	logP, logSTC, logQ0 := sh.LogP, sh.LogSTC, sh.LogQ0
 	if logP == nil {
 		logP = DefaultLogP()
 	}
@@ -123,9 +96,6 @@ func TranscipheringParamsWith(logN, k, cleanDepth, extractLv int, sh Shape) (ckk
 	}
 	if logQ0 == 0 {
 		logQ0 = DefaultLogQ0
-	}
-	if zone < 1 || zone > LogScale {
-		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("logZone %d, want between 1 and LogScale %d", zone, LogScale)
 	}
 	if logQ0 < LogScale || logQ0 > LogScale+k {
 		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("logQ0 %d, want between LogScale %d (message ratio 1) and LogScale+k %d (ratio 2^k)", logQ0, LogScale, LogScale+k)
@@ -143,21 +113,19 @@ func TranscipheringParamsWith(logN, k, cleanDepth, extractLv int, sh Shape) (ckk
 		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("extractLv %d, want %d or %d", extractLv, k, k+1)
 	}
 	logQ := []int{logQ0}
-	logQ = append(logQ, logSTC...) // SlotsToCoeffs, one level per prime
-	// The zone: every stage from here to the bit extraction runs at ZoneScale.
-	logQ = append(logQ, zone)             // Conv_{Real->Cplx}
-	logQ = append(logQ, zone, zone, zone) // SubBytes
+	logQ = append(logQ, logSTC...)  // SlotsToCoeffs, one level per prime
+	logQ = append(logQ, 38)         // Conv_{Real->Cplx}
+	logQ = append(logQ, 38, 38, 38) // SubBytes
 	for i := 0; i < cleanDepth; i++ {
-		logQ = append(logQ, zone) // cleaning
+		logQ = append(logQ, 38) // cleaning
 	}
-	logQ = append(logQ, zone)             // AddRoundKey
-	logQ = append(logQ, zone, zone, zone) // MixColumns
+	logQ = append(logQ, 38)         // AddRoundKey
+	logQ = append(logQ, 38, 38, 38) // MixColumns
 	// refresh
-	logQ = append(logQ, zone) // Conv_{Cplx->Real}
+	logQ = append(logQ, 38) // Conv_{Cplx->Real}
 	for i := 0; i < extractLv; i++ {
-		logQ = append(logQ, zone) // bit extraction
+		logQ = append(logQ, 38) // bit extraction
 	}
-	// End of the zone.
 	logQ = append(logQ, 38, 38, 38)         // 3 levels for squaring
 	logQ = append(logQ, 38)                 // extractExp
 	logQ = append(logQ, 38)                 // Conv_{Real->Cplx}

@@ -15,7 +15,6 @@ import (
 	"github.com/tuneinsight/lattigo/v6/nathanfau/blockpack"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/cleaning"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/debug"
-	"github.com/tuneinsight/lattigo/v6/nathanfau/params2"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 )
 
@@ -27,19 +26,7 @@ var (
 	placeFlag   = flag.String("place", "after", `where the round cleaning lands: "after" (AddRoundKey then Cleaning), "both" (clean state and key, then XOR) or "one" (clean the state only, then XOR)`)
 	xtractFlag  = flag.Bool("cleanextract", false, "run the refresh on BitExtractClean (interpolation and cleaning fused, error quadratic in Algo1's output) instead of BitExtract (half spectrum, error linear); costs one prime more")
 	seedFlag    = flag.Int64("seed", 0, "seed of the block draw; 0 draws one from the clock")
-	zoneFlag    = flag.Int("zone", 0, "size of the primes of the AES circuit and the bit extraction, and of the scale there (params2.Shape.LogZone); 0 or 38 = no zone, the pipeline as it always ran")
 )
-
-// shape is the parameter shape -zone asks for.
-func shape() params2.Shape { return params2.Shape{LogZone: *zoneFlag} }
-
-// zoneName is what the trace calls the zone -zone asks for.
-func zoneName() string {
-	if !shape().HasZone() {
-		return "none"
-	}
-	return fmt.Sprintf("%d bits", *zoneFlag)
-}
 
 // blockSeed fixes WHICH blocks the batch carries, so two configs can be compared on the same
 // input. It does NOT fix the key or the encryption noise, which lattigo draws from crypto/rand:
@@ -96,10 +83,10 @@ func TestTransciphering(t *testing.T) {
 		n = 1
 	}
 	cfg := config(t)
-	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, zone=%s \n",
-		n, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), zoneName())
+	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s \n",
+		n, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg))
 
-	ctx, err := NewContextWith2(logN, k, cfg, shape())
+	ctx, err := NewContextWith(logN, k, cfg)
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -118,7 +105,7 @@ func TestTransciphering(t *testing.T) {
 		aes.AddRoundKey(states[bi][:], rk[0])
 	}
 
-	st, err := blockpack.EncryptAt(ciP, ctx.EcdCI, ctx.EncCI, states, SubBytesLevel, ctx.Canon)
+	st, err := blockpack.Encrypt(ciP, ctx.EcdCI, ctx.EncCI, states, SubBytesLevel)
 	if err != nil {
 		t.Fatalf("blockpack.Encrypt state: %v", err)
 	}
@@ -206,7 +193,7 @@ func TestAES(t *testing.T) {
 
 	cfg := config(t)
 
-	ctx, err := NewContextWith2(logN, k, cfg, shape())
+	ctx, err := NewContextWith(logN, k, cfg)
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -219,8 +206,8 @@ func TestAES(t *testing.T) {
 
 	seed := blockSeed()
 	blocks := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
-	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, zone=%s, %d blocks, random seed = %d \n",
-		nMiddle, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), zoneName(), len(blocks), seed)
+	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, %d blocks, random seed = %d \n",
+		nMiddle, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), len(blocks), seed)
 
 	rec, err := newAESCSV(*csvFlag, ctx, cfg, logN, k, len(blocks), nMiddle, seed)
 	if err != nil {
@@ -334,14 +321,14 @@ func TestAES(t *testing.T) {
 }
 
 // encRK packs a round key at the given level: the key stream is shared, so the 16 bytes are
-// replicated over the whole batch and packed exactly like a state, at the state's scale.
+// replicated over the whole batch and packed exactly like a state.
 func encRK(t *testing.T, ctx *Context, rk []byte, blocks, level int) blockpack.Packed {
 	t.Helper()
 	repl := make([][16]byte, blocks)
 	for bi := range repl {
 		copy(repl[bi][:], rk)
 	}
-	p, err := blockpack.EncryptAt(ctx.Sw.CiP, ctx.EcdCI, ctx.EncCI, repl, level, ctx.Canon)
+	p, err := blockpack.Encrypt(ctx.Sw.CiP, ctx.EcdCI, ctx.EncCI, repl, level)
 	if err != nil {
 		t.Fatalf("encrypt round key at level %d: %v", level, err)
 	}
