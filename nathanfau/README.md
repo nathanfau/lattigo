@@ -6,7 +6,6 @@ ModSwitch
 FreeXor (for less than 2^15 aes blocks, new packing, new BTS...)
 rounds without oracle call
 logN 16
-use ByHand
 
 # Lattigo Fork
 
@@ -95,19 +94,68 @@ hazard: at input 2^-2, `XorSq` followed by cleaning reaches worst = -3.35 bits
 (absolute error ~10) because the XOR pushed values out of [0,1] and the polynomial
 diverged instead of contracting; cleaning first keeps both operands inside it.
 
-### `q0` can be freed from the message ratio
+### `convctx`: masking and key switch are swapped, on purpose
 
-Lattigo couples the bottom prime to the scale by `log2(q0) = LogDefaultScale + LogMessageRatio`,
-which costs 4 bits of `q0` at `k = 4` (`42 = 38 + 4`). The coupling can be dropped: set
-`LogMessageRatio = 0` and carry the `1/t` in the `SlotsToCoeffs` scaling, bringing `q0` down to
-`38`. The `ScaleDown` guard compares `q0/scale` to `MessageRatio` and both sides drop by `2^k`,
-so it still passes; and `qDiv` becomes 1, so `CoeffsToSlots` regains the factor `t` that
-`SlotsToCoeffs` gives up, so nothing downstream is recalibrated. Tested end to end on `algo1`:
-it works, and it is more faithful. But it is also less precise, for 4 bits of `LogQP`... not
-enough to be worth it, so we keep `q0 = 42`.
+[BCKK25] Fig. 1 masks first (step 2) and key switches after (step 3). We do the opposite:
+lattigo's `RealToComplex` fuses the ring embedding of step (1) with the key switch of step (3)
+into a single call, so taking the paper's order means unfolding by hand and applying the
+ring-swap key separately. The two orders give the same result but not the same noise, because 
+the key switch then runs one level higher, with one gadget decomposition digit more.
 
-Trap: `F = (ScalingFactor/MessageRatio)/DefaultScale` cancels exactly the `StCScaling` lattigo
-applies on top, so `Scaling = F` is net-neutral whatever the ratio. It has to be written `F/t`.
+Both orders were implemented and measured against the exact value, 16 draws, at the two levels
+where the pipeline actually converts CI → Std (2, the nibbles out of SubBytes; 21, out of
+`EvalCos`/`EvalSin` in algo1). Only ours survives in the tree, as `CIToStandard`; the paper-order
+variant was deleted once the table below settled the question:
+
+| chain | level | ours, avg / worst | paper, avg / worst | paper − ours |
+|---|---|---|---|---|
+| params2, logN 11 | 2  | 29.25 / 26.60 | 28.94 / 26.47 | −0.31 / −0.13 |
+| params2, logN 11 | 21 | 29.25 / 26.46 | 28.94 / 26.53 | −0.31 / +0.07 |
+| params2, logN 12 | 2  | 28.74 / 26.10 | 28.44 / 25.86 | −0.30 / −0.24 |
+| params2, logN 12 | 21 | 28.74 / 26.00 | 28.44 / 25.90 | −0.30 / −0.10 |
+
+Our order wins ~0.30 bit on the average everywhere, and on the worst slot in three cases out of four; the remaining `+0.07` sits inside the scatter
+of a worst-slot statistic. So the swap is kept.
+
+### `dnum` is not a free parameter here, so `P` is sized in `Q` primes
+
+The number of key-switching digits never appears as a parameter in lattigo.
+It is derived — `dnum = Ceil(#Q/#P)` (`core/rlwe/params.go:543`) — and the decomposition itself is
+built on `nbPi := len(P)` **consecutive `Q` primes per digit** (`ring/basis_extension.go:336`), the
+last digit taking the remainder. The digit width is therefore counted in *primes*, and the only way
+to set `dnum` is to choose how many primes `P` holds.
+
+So `dnum` cannot be set by hand here. Parameter tables in [BCKK25] are written the other way
+round: `dnum` is the input, the chain is cut into `dnum` digits, and `P` is then sized *in bits* to
+cover the widest one. OpenFHE exposes that directly (`numLargeDigits`), and their Table 1
+shows HEaaN does too — its `Param` rows use **62-bit** `P` primes against a 33/38-bit chain and
+print `dnum = 3` with 6 `P` primes over ~32 `Q` primes, where `Ceil(32/6) = 6`. The two conventions
+coincide **iff the `P` primes have the size of the `Q` primes** — only then is "as many primes as
+`P` has" the same cut as "as many bits as `P` has".
+
+Their XBOOT rows are exactly that case, and there lattigo's formula is exact: 38-bit `P` primes on a
+36–38-bit chain give (17 `Q` primes, 5 `P`) → 4, (18, 4) → 5, (20, 2) → 10, the three `dnum`
+printed, with `log(PQ)` adding up to the bit (829, 828).
+
+**Hence our `P` departs from theirs**, and it has to: lattigo caps a `P` prime at 61 bits
+(`checkModuliLogSize`, `MaxModuliSize+1`), so `62*6` is refused outright, and even at 61 bits 6
+primes would mean `dnum = 6`, not 3. The faithful translation preserves `log(P)` and the digit,
+never the prime count.
+
+We follow XBOOT instead and size `P` in `Q` primes, which lands `log(P)` just above the digit by
+construction — which is where it belongs, because the margin is a step and not a slope: swept at
+`logN = 12`, every `P` above its digit returns the same precision to the tenth of a bit, and below
+it the worst slot falls by about a bit per bit. Every bit past the digit is `log(QP)` given away.
+Our old `6*61+50` sat at +124; the current `8*42` sits at +10.
+
+The rule that follows: pick `dnum`, then take `#P = Ceil(#Q/dnum)` primes of `Ceil(digit/#P)` bits.
+More `P` primes at that `dnum` pay `#Q + #P` for nothing; fewer raise `dnum`. On our chain,
+`dnum 5 → 7*42`, `dnum 4 → 8*42`, `dnum 3 → 11*41`.
+
+What we keep from [BCKK25] is the chain `Q` — every level, every scale, every calibration of the
+pipeline is theirs. `P` carries no message and no level, so its shape is invisible to the circuit
+and changes only what a key-switch costs and how much noise it leaves. There is no faithfulness to
+lose here, only bits.
 
 ## Testing
 
@@ -118,7 +166,19 @@ order:
 go test ./nathanfau/<package>/ -v
 ```
 
-`debug`, `params2` and `utils` have no test of their own; they are exercised through the packages that use them. Two packages take flags.
+`debug`, `params2` and `utils` have no test of their own; they are exercised through the packages that use them. Three packages take flags.
+
+### algo1
+
+`TestAlgo1Zone` is `TestAlgo1` on the transciphering chain with a zone: the primes from
+Conv_{Real->Cplx} up to the bit extraction, and the scale they run at, take `-zone` bits (default
+33; 38 is the chain without a zone). The scale is checked at each edge of the zone. `-pre` and
+`-post` add that many XOR layers before the refresh and after the bit extraction (default 0), so
+the scale drifts the way the AES circuit makes it drift.
+
+```bash
+go test ./nathanfau/algo1/ -run '^TestAlgo1Zone$' -v -zone 33 -pre 3 -post 4 -timeout 0
+```
 
 ### blockpack
 
@@ -134,7 +194,7 @@ go test ./nathanfau/blockpack/ -v
 
 `-rounds` is how many AES middle rounds `TestTransciphering` chains (default 1), `-subbytes` picks the SubBytes variant, 1 to 3 by decreasing cost (247, 98 and 69 relinearisations per byte). The default is 2, the middle one.
 
-Four more flags select the variants the pipeline runs on, so a whole matrix of circuits can be
+Five more flags select the variants the pipeline runs on, so a whole matrix of circuits can be
 compared without touching the code:
 
 | flag | values | default |
@@ -143,6 +203,7 @@ compared without touching the code:
 | `-clean` | `cleaning` (2 levels), `smoother` or `verysmoother` (3 levels, one prime more) | `cleaning` |
 | `-place` | `after` (AddRoundKey then Cleaning), `both` (clean both operands, then XOR), `one` (clean the state only, then XOR) | `after` |
 | `-seed` | seed of the block draw, 0 draws one from the clock | `0` |
+| `-zone` | size of the primes of the AES circuit and the bit extraction, and of their scale; `0` or `38` is no zone | `0` |
 
 `-xor` is the one that decides whether the cipher completes. It applies to **every** gate: the
 initial AddRoundKey, the round AddRoundKey, and the XOR trees of MixColumns. `sq` fails a full
@@ -156,6 +217,11 @@ level a round key has to be encrypted at, which `Context.ARKKeyLv` and `Context.
 
 `-seed` fixes which blocks the batch carries, not the key or the encryption noise, which lattigo
 draws from `crypto/rand`: two runs on one seed are far closer than on two, not identical.
+
+`-zone`, like `-clean`, is baked into the parameters. With a zone, the state and the round keys
+are encrypted at its scale, the refresh leaves it for the bootstrap and Algo1 lands back on it;
+without one the pipeline runs exactly as before. A run in a zone shows in the CSV through
+`q_sizes` and `chain_id`.
 
 ```bash
 go test ./nathanfau/transciphering/ -run '^TestTransciphering$' -v -subbytes 3 -rounds 1 -timeout 0
