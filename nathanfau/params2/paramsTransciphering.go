@@ -5,11 +5,13 @@ package params2
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/dft"
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/mod1"
+	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
@@ -38,40 +40,124 @@ func ciThenStd(logN int, logQ, logP []int, logScale int) (ckks.Parameters, error
 	return params, nil
 }
 
-// TranscipheringParams is TranscipheringParamsDepth at the default cleaning depth, 2 levels, i.e.
-// cleaning.Cleaning, and the default extraction, bitbatching.BitExtract at k levels. It must stay in
-// step with transciphering.DefaultCleanDepth, which cannot be imported here: transciphering already
-// depends on this package.
+// TranscipheringParams is TranscipheringParamsWith at the default cleaning depth, 2 levels, i.e.
+// cleaning.Cleaning, the default extraction, bitbatching.BitExtract at k levels, and the pipeline's
+// own shape. It must stay in step with transciphering.DefaultCleanDepth, which cannot be imported
+// here: transciphering already depends on this package.
 func TranscipheringParams(logN, k int) (ckks.Parameters, bootstrapping.Parameters, error) {
-	return TranscipheringParamsDepth(logN, k, 2, k)
+	return TranscipheringParamsWith(logN, k, 2, k, Shape{})
 }
 
-// TranscipheringParamsDepth is the Algo1 pipeline parameter set (the leveled AES round + Algo1
-// refresh of nathanfau/transciphering): MessageRatio = 2^k so q0 = base + k = 42 at k = 4, K = t=2^k.
-//
-// extractLv is how many primes the bit extraction spends: k for bitbatching.BitExtract, k+1 for
-// BitExtractClean. It sits above the refresh, so it lengthens the chain without moving RefreshLevel.
-func TranscipheringParamsDepth(logN, k, cleanDepth, extractLv int) (ckks.Parameters, bootstrapping.Parameters, error) {
+// DefaultLogP is the auxiliary modulus: 8 primes of 42 bits, i.e. dnum = Ceil(#Q/8) = 4 digits on
+// the 31-prime chain. 42 is the smallest size still covering the widest digit (326 bits), and
+// anything above that margin is log(QP) spent on noise already below the rounding.
+func DefaultLogP() []int { return []int{42, 42, 42, 42, 42, 42, 42, 42} }
+
+// DefaultLogSTC is what SlotsToCoeffs spends: one 60-bit prime, hence one level. It is what makes
+// the bottom key-switching digit 22 bits wider than a run of 38-bit primes; splitting it over more
+// primes spreads the same budget over more levels, and lifts the whole circuit by as many.
+func DefaultLogSTC() []int { return []int{60} }
+
+// STCLevels is the SlotsToCoeffs depth a given set of primes buys: one level each.
+func STCLevels(logSTC []int) []int {
+	lv := make([]int, len(logSTC))
+	for i := range lv {
+		lv[i] = 1
+	}
+	return lv
+}
+
+// LogScale is the default scale of the pipeline, and the size of every prime of the chain but q0,
+// the SlotsToCoeffs block and the zone (Shape.LogZone).
+const LogScale = 38
+
+// DefaultLogZone is the zone's prime size when Shape.LogZone is left at zero: LogScale, i.e. no
+// zone at all, the chain the pipeline has always run on.
+const DefaultLogZone = LogScale
+
+// DefaultLogQ0 is the bottom prime. Lattigo couples it to the scale by q0 = LogScale + k for a
+// message ratio of 2^k; we drop the coupling and run at LogScale, ratio 1, the 1/t being carried by
+// the SlotsToCoeffs scaling instead (see the README) -- measured, the ratio costs nothing.
+const DefaultLogQ0 = LogScale
+
+// Shape is the part of the parameter set the sweeps vary. The zero value is the pipeline's own.
+type Shape struct {
+	LogP   []int // sizes of the P primes; nil = DefaultLogP
+	LogSTC []int // sizes of the SlotsToCoeffs primes, one level each; nil = DefaultLogSTC
+	LogQ0  int   // size of the bottom prime; 0 = DefaultLogQ0. The message ratio follows it:
+	// LogMessageRatio = LogQ0 - LogScale, so 42 gives 2^4 and 38 gives 1.
+
+	// LogZone is the size of the primes from Conv_{Real->Cplx} up to the bit extraction, i.e. the
+	// AES circuit and the bottom of the refresh; 0 = DefaultLogZone. Those stages multiply
+	// ciphertexts together, so the scale they run at must be the size of their primes: LogZone is
+	// both, and ZoneScale is that scale. The bootstrap above and below keeps LogScale.
+	LogZone int
+}
+
+// logZone is LogZone with its zero resolved.
+func (sh Shape) logZone() int {
+	if sh.LogZone == 0 {
+		return DefaultLogZone
+	}
+	return sh.LogZone
+}
+
+// HasZone reports whether sh runs a zone, i.e. primes of another size than LogScale.
+func (sh Shape) HasZone() bool { return sh.logZone() != DefaultLogZone }
+
+// ZoneScale is the scale a ciphertext must carry inside the zone sh describes: 2^LogZone, which
+// is the pipeline's own default scale when there is no zone.
+func (sh Shape) ZoneScale() rlwe.Scale { return rlwe.NewScale(math.Exp2(float64(sh.logZone()))) }
+
+// TranscipheringParamsWith is the Algo1 pipeline parameter set (nathanfau/transciphering) on a
+// fully specified shape, sh's zero fields meaning the pipeline's own. cleanDepth is the cleaning
+// polynomial's depth and extractLv the bit extraction's, k or k+1; both lengthen the chain above
+// the circuit, where a longer SlotsToCoeffs lengthens it below and shifts every level up.
+func TranscipheringParamsWith(logN, k, cleanDepth, extractLv int, sh Shape) (ckks.Parameters, bootstrapping.Parameters, error) {
+	logP, logSTC, logQ0, zone := sh.LogP, sh.LogSTC, sh.LogQ0, sh.logZone()
+	if logP == nil {
+		logP = DefaultLogP()
+	}
+	if logSTC == nil {
+		logSTC = DefaultLogSTC()
+	}
+	if logQ0 == 0 {
+		logQ0 = DefaultLogQ0
+	}
+	if zone < 1 || zone > LogScale {
+		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("logZone %d, want between 1 and LogScale %d", zone, LogScale)
+	}
+	if logQ0 < LogScale || logQ0 > LogScale+k {
+		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("logQ0 %d, want between LogScale %d (message ratio 1) and LogScale+k %d (ratio 2^k)", logQ0, LogScale, LogScale+k)
+	}
+	if len(logSTC) == 0 {
+		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("logSTC is empty: SlotsToCoeffs spends at least one prime")
+	}
+	if len(logP) == 0 {
+		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("logP is empty: the pipeline key-switches, so it needs at least one P prime")
+	}
 	if cleanDepth < 2 || cleanDepth > 3 {
 		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("cleanDepth %d, want 2 or 3", cleanDepth)
 	}
 	if extractLv < k || extractLv > k+1 {
 		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("extractLv %d, want %d or %d", extractLv, k, k+1)
 	}
-	logQ := []int{42}
-	logQ = append(logQ, 60)         // SlotsToCoeffs
-	logQ = append(logQ, 38)         // Conv_{Real->Cplx}
-	logQ = append(logQ, 38, 38, 38) // SubBytes
+	logQ := []int{logQ0}
+	logQ = append(logQ, logSTC...) // SlotsToCoeffs, one level per prime
+	// The zone: every stage from here to the bit extraction runs at ZoneScale.
+	logQ = append(logQ, zone)             // Conv_{Real->Cplx}
+	logQ = append(logQ, zone, zone, zone) // SubBytes
 	for i := 0; i < cleanDepth; i++ {
-		logQ = append(logQ, 38) // cleaning
+		logQ = append(logQ, zone) // cleaning
 	}
-	logQ = append(logQ, 38)         // AddRoundKey
-	logQ = append(logQ, 38, 38, 38) // MixColumns
+	logQ = append(logQ, zone)             // AddRoundKey
+	logQ = append(logQ, zone, zone, zone) // MixColumns
 	// refresh
-	logQ = append(logQ, 38) // Conv_{Cplx->Real}
+	logQ = append(logQ, zone) // Conv_{Cplx->Real}
 	for i := 0; i < extractLv; i++ {
-		logQ = append(logQ, 38) // bit extraction
+		logQ = append(logQ, zone) // bit extraction
 	}
+	// End of the zone.
 	logQ = append(logQ, 38, 38, 38)         // 3 levels for squaring
 	logQ = append(logQ, 38)                 // extractExp
 	logQ = append(logQ, 38)                 // Conv_{Real->Cplx}
@@ -79,7 +165,7 @@ func TranscipheringParamsDepth(logN, k, cleanDepth, extractLv int) (ckks.Paramet
 	logQ = append(logQ, 38)                 // Conv_{Cplx->Real}
 	logQ = append(logQ, 38, 38, 38)         // CoeffsToSlots
 
-	params, err := ciThenStd(logN, logQ, []int{61, 61, 61, 61, 61, 61, 50}, 38)
+	params, err := ciThenStd(logN, logQ, logP, 38)
 	if err != nil {
 		return ckks.Parameters{}, bootstrapping.Parameters{}, err
 	}
@@ -88,7 +174,7 @@ func TranscipheringParamsDepth(logN, k, cleanDepth, extractLv int) (ckks.Paramet
 		Type:     dft.HomomorphicDecode,
 		LogSlots: params.LogMaxSlots(),
 		LevelP:   params.MaxLevelP(),
-		Levels:   []int{1},
+		Levels:   STCLevels(logSTC),
 	}
 	S2CParams.LevelQ = len(S2CParams.Levels)
 
@@ -107,13 +193,16 @@ func TranscipheringParamsDepth(logN, k, cleanDepth, extractLv int) (ckks.Paramet
 		Mod1Type:        mod1.CosDiscrete,
 		Mod1Degree:      2 * ((1 << k) - 1),
 		K:               1 << k,
-		LogMessageRatio: k,
+		LogMessageRatio: logQ0 - LogScale,
 	}
 	mod1P, err := mod1.NewParametersFromLiteral(params, Mod1Params)
 	if err != nil {
 		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("mod1 params: %w", err)
 	}
-	F := (mod1P.ScalingFactor().Float64() / mod1P.MessageRatio()) / params.DefaultScale().Float64()
+	// SlotsToCoeffs hands the mod-1 circuit a message already divided by t, whatever q0 is. The
+	// message ratio carries that division only when q0 = LogScale + k, so the 1/t is written here:
+	// the same number in that case, and the right one in both.
+	F := mod1P.ScalingFactor().Float64() / (params.DefaultScale().Float64() * float64(uint(1)<<k))
 	S2CParams.Scaling = big.NewFloat(F)
 
 	btpParams := bootstrapping.Parameters{

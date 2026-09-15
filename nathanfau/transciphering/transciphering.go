@@ -41,19 +41,35 @@ type Context struct {
 	EncCI *rlwe.Encryptor
 	DecCI *rlwe.Decryptor
 
-	K      int        // bits packed per ciphertext (t = 2^K)
-	Target int        // Algo1 input level (S2C LevelQ)
-	Canon  rlwe.Scale // canonical output scale after refresh
+	K      int // bits packed per ciphertext (t = 2^K)
+	Target int // Algo1 input level (S2C LevelQ)
+
+	// Canon is the scale of the state in the AES circuit: where Refresh leaves it, and where the
+	// state and the round keys are encrypted. It is the zone's scale when there is one, the default
+	// scale otherwise.
+	Canon rlwe.Scale
+	// Zone is the scale of the zone (params2.Shape.LogZone), zero when the chain has none. With a
+	// zone, Refresh hops out of it onto algo1.EntryScale and Algo1 lands back on it.
+	Zone rlwe.Scale
 
 	Cfg Config // the variants this context runs on
 
-	// Levels that move with the cleaning depth, i.e. with the length of the chain.
-	RefreshLv int // level the refresh hands the state back at
-	ARKLv     int // level AddRoundKey (or the fused XorClean) starts at
+	// Levels that move with the cleaning depth, i.e. with the length of the chain, and with the
+	// SlotsToCoeffs block: every prime it spends beyond the first lifts the pipeline by a level.
+	SubBytesLv int // state level entering a round
+	InitLv     int // rk0 and the encoded blocks: SubBytesLv + 1, one level for the XOR
+	RefreshLv  int // level the refresh hands the state back at
+	ARKLv      int // level AddRoundKey (or the fused XorClean) starts at
 
 	// Levels the round keys have to be encrypted at, which follow Cfg.Place.
 	ARKKeyLv  int // middle rounds
 	LastKeyLv int // last round, no MixColumns
+
+	// What the key material cost to build and how much of it there is, measured at construction.
+	// The auxiliary modulus P moves both, so a P sweep reads them here.
+	BtpKeyGen, SwKeyGen     time.Duration
+	EvalSetup               time.Duration // the DFT matrices, which P does not move
+	BtpKeyBytes, SwKeyBytes int
 }
 
 // Config selects the variants a Context runs on. The zero value is the pipeline default: the
@@ -91,6 +107,9 @@ func (c Config) ExtractLevels(k int) int {
 	return k
 }
 
+// The levels below are those of the DEFAULT chain, whose SlotsToCoeffs spends a single prime; a
+// context carries its own in SubBytesLv, InitLv, RefreshLv and ARKLv, which is what the pipeline
+// reads. These stay as the reference the tests are written against.
 const (
 	SubBytesLevel = 5 // state level entering a round; below the cleaning block, so it never moves
 	InitLevel     = 6 // rk0 and the encoded blocks: SubBytesLevel + 1, one level for the XOR
@@ -116,8 +135,16 @@ func NewContext(logN, k int) (*Context, error) {
 // NewContextWith is NewContext on the variants cfg selects. The chain is built for cfg.Clean's
 // depth, so RefreshLv and ARKLv follow it.
 func NewContextWith(logN, k int, cfg Config) (*Context, error) {
+	return NewContextWith2(logN, k, cfg, params2.Shape{})
+}
+
+// NewContextWith2 is NewContextWith on a chosen parameter shape (see params2.Shape). P leaves Q
+// untouched and moves only the key-switching, where the SlotsToCoeffs block and q0 reshape the
+// chain itself, so the context's own levels follow them. A zone keeps the levels and moves the
+// scale instead: see Context.Zone.
+func NewContextWith2(logN, k int, cfg Config, sh params2.Shape) (*Context, error) {
 	depth := cfg.Clean.Depth()
-	params, btpParams, err := params2.TranscipheringParamsDepth(logN, k, depth, cfg.ExtractLevels(k))
+	params, btpParams, err := params2.TranscipheringParamsWith(logN, k, depth, cfg.ExtractLevels(k), sh)
 	if err != nil {
 		return nil, fmt.Errorf("TranscipheringParams: %w", err)
 	}
@@ -130,11 +157,16 @@ func NewContextWith(logN, k int, cfg Config) (*Context, error) {
 	if err != nil {
 		return nil, fmt.Errorf("GenEvaluationKeys: %w", err)
 	}
+	btpKeyGen, btpKeyBytes := time.Since(t0), evk.BinarySize()
+	t1 := time.Now()
 	eval, err := bootstrapping.NewEvaluator(btpParams, evk)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrapping NewEvaluator: %w", err)
 	}
-	fmt.Printf("Done !(%s)\n", time.Since(t0).Round(time.Millisecond))
+	// NewEvaluator is not key generation: it encodes the two DFT matrices, plaintexts living in Q
+	// alone. It costs real time and does NOT move with P, so it is timed apart.
+	evalSetup := time.Since(t1)
+	fmt.Printf("Done !(%s, dont %s de matrices DFT)\n", time.Since(t0).Round(time.Millisecond), evalSetup.Round(time.Millisecond))
 
 	fmt.Println("CtxSwitcher KeyGen ...")
 	t0 = time.Now()
@@ -142,7 +174,8 @@ func NewContextWith(logN, k int, cfg Config) (*Context, error) {
 	if err != nil {
 		return nil, fmt.Errorf("NewCtxSwitcher: %w", err)
 	}
-	fmt.Printf("Done !(%s)\n", time.Since(t0).Round(time.Millisecond))
+	swKeyGen := time.Since(t0)
+	fmt.Printf("Done !(%s)\n", swKeyGen.Round(time.Millisecond))
 
 	ae := aes.NewEvaluator(sw.EvalCI)
 
@@ -158,13 +191,31 @@ func NewContextWith(logN, k int, cfg Config) (*Context, error) {
 		Target: eval.SlotsToCoeffsParameters.LevelQ,
 		Canon:  sw.CiP.DefaultScale(),
 
-		Cfg:       cfg,
-		RefreshLv: RefreshLevelFor(depth),
-		ARKLv:     ARKLevelFor(depth),
+		Cfg: cfg,
 
-		// CleanOne is the only placement that sends the key straight to the XOR, i.e. below h(state).
-		ARKKeyLv:  ARKLevelFor(depth) - cfg.Place.YDrop(depth),
-		LastKeyLv: RefreshLevelFor(depth) - cfg.Place.YDrop(depth),
+		BtpKeyGen:   btpKeyGen,
+		SwKeyGen:    swKeyGen,
+		EvalSetup:   evalSetup,
+		BtpKeyBytes: btpKeyBytes,
+		SwKeyBytes:  sw.KeyBytes,
+	}
+
+	// Target is the SlotsToCoeffs prime count: one is the default chain, each extra one lifts
+	// everything above it by a level.
+	lift := c.Target - 1
+	c.SubBytesLv = SubBytesLevel + lift
+	c.InitLv = InitLevel + lift
+	c.RefreshLv = RefreshLevelFor(depth) + lift
+	c.ARKLv = ARKLevelFor(depth) + lift
+	// CleanOne is the only placement that sends the key straight to the XOR, i.e. below h(state).
+	c.ARKKeyLv = c.ARKLv - cfg.Place.YDrop(depth)
+	c.LastKeyLv = c.RefreshLv - cfg.Place.YDrop(depth)
+
+	// With a zone the state lives at its scale, so Canon follows it. Without one nothing hops, and
+	// the pipeline runs exactly as it did before zones existed.
+	if sh.HasZone() {
+		c.Zone = sh.ZoneScale()
+		c.Canon = c.Zone
 	}
 
 	// Debug decoding contexts: Std (residual) and CI (AES circuit).
@@ -178,8 +229,8 @@ func NewContextWith(logN, k int, cfg Config) (*Context, error) {
 // so the 'server' encodes them itself and the XOR is ciphertext against plaintext.
 // rk0 must be at InitLevel.
 func (c *Context) FirstRound(blocks [][16]byte, rk0 blockpack.Packed) (blockpack.Packed, error) {
-	if l := rk0[0][0].Level(); l != InitLevel {
-		return blockpack.Packed{}, fmt.Errorf("FirstRound: rk0 at level %d, want InitLevel %d", l, InitLevel)
+	if l := rk0[0][0].Level(); l != c.InitLv {
+		return blockpack.Packed{}, fmt.Errorf("FirstRound: rk0 at level %d, want InitLevel %d", l, c.InitLv)
 	}
 	xor := c.AE.PlainOf(c.Cfg.Xor)
 
@@ -211,10 +262,20 @@ func (c *Context) SubBytes(st blockpack.Packed, version int) (blockpack.Packed, 
 	return out, nil
 }
 
-// Refresh refreshes the whole state and applies ShiftRows at the Algo1 pause
+// zoneScaleTol is how close, in bits, Refresh's output must land on the zone's scale before it is
+// labelled with it: off by more, the label would change the value.
+const zoneScaleTol = 30
+
+// inZone reports whether the context runs a zone (see Context.Zone).
+func (c *Context) inZone() bool { return c.Zone.Value.Sign() != 0 }
+
+// Refresh refreshes the whole state and applies ShiftRows at the Algo1 pause. With a zone, the
+// conversion to Std is also the hop out of it, onto the scale Algo1 wants, and Algo1 lands back on
+// the zone's scale (algo1.ExtractTo).
 func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 	eval := c.Eval
 	ck := eval.Evaluator
+	entry := algo1.EntryScale(eval)
 
 	// 1-2. BitPack the 4-bit nibbles in CI, then convert to Std
 	var packed [16]*rlwe.Ciphertext
@@ -228,7 +289,11 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			return blockpack.Packed{}, fmt.Errorf("refresh BitPack high g=%d: %w", g, err)
 		}
 		for i, ciNib := range [2]*rlwe.Ciphertext{lo, hi} {
-			s, err := c.Sw.CIToStandard(ciNib)
+			out := ciNib.Scale // no zone: the conversion keeps the scale
+			if c.inZone() {
+				out = entry
+			}
+			s, err := c.Sw.CIToStandardTo(ciNib, out)
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("refresh CIToStandard g=%d nibble %d: %w", g, i, err)
 			}
@@ -243,7 +308,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 		if d := packed[p].Level() - c.Target; d > 0 {
 			ck.DropLevel(packed[p], d)
 		}
-		rr, ii, err := algo1.Extract(eval, c.Sw, packed[p], c.K)
+		rr, ii, err := algo1.ExtractTo(eval, c.Sw, packed[p], c.K, c.Zone)
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh Extract packet %d: %w", p, err)
 		}
@@ -292,6 +357,10 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			ci, err := c.Sw.StandardToCI(z)
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("refresh StandardToCI j=%d beta=%d: %w", j, beta, err)
+			}
+			if c.inZone() && !ci.Scale.InDelta(c.Canon, zoneScaleTol) {
+				return blockpack.Packed{}, fmt.Errorf("refresh j=%d beta=%d: scale 2^%.6f is 2^-%.1f off the zone's 2^%.6f, want below 2^-%d",
+					j, beta, ci.Scale.Log2(), ci.Scale.Log2Delta(c.Canon), c.Canon.Log2(), zoneScaleTol)
 			}
 			ci.Scale = c.Canon
 			out[j][beta] = ci
