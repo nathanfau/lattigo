@@ -1,8 +1,8 @@
 # aesplot — précision le long d'un AES homomorphe
 
 `TestAES` écrit une ligne par opération dans un CSV ; `plot.py` en fait des courbes. Une couleur par
-run, `prec_min` (le pire slot sur **tous** les blocs) en ordonnée, l'indice de l'opération en
-abscisse.
+run, `prec_min` (le pire slot sur **tous** les blocs) en ordonnée, et en abscisse le temps de
+pipeline cumulé — `--x seq` remet l'indice de l'opération.
 
 Toutes les commandes de ce README se lancent **depuis la racine du dépôt**.
 
@@ -13,8 +13,7 @@ s'empilent.
 
 ```sh
 go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -csv runs/aes.csv
-go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -cleanextract -csv runs/aes.csv
-go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -cleanextract -xor sq -csv runs/aes.csv
+go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -cleanextract -csv runs/aes2.csv ; go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -cleanextract -xor sq -csv runs/aes2.csv
 ```
 
 `-csv` est relatif au **répertoire du package**, pas au tien : `go test` y place le binaire de test,
@@ -45,6 +44,7 @@ propriété du circuit.
 
 | flag | effet |
 |---|---|
+| `--x time\|seq` | abscisse : le temps de pipeline cumulé (défaut) ou le rang de l'opération |
 | `--where COL=VAL` | ne garder que ces runs. Répétable |
 | `--split COL` | un PNG par valeur de `COL`. Défaut `logn`, `none` pour tout réunir |
 | `--avg` | ajoute `prec_avg` en pointillés (par défaut, seul le pire slot) |
@@ -156,11 +156,39 @@ python3 -c "import pandas as pd; d=pd.read_csv('nathanfau/transciphering/runs/ae
 
 ## Colonnes du CSV
 
-Configuration (répétée sur chaque ligne) : `run_ts`, `logn`, `k`, `slots`, `blocks`, `seed`,
-`rounds`, `subbytes`, `xor`, `clean`, `cleandepth`, `place`, `extract`, `extractlv`, `primes`,
-`logscale`, `refresh_lv`, `ark_lv`.
+Tout ce qui suit est **répété sur chaque ligne**, pour qu'aucune ne soit ambiguë sur ce qui l'a
+produite.
 
-Position et coût : `seq` (l'ordre d'exécution, l'abscisse des tracés), `round`, `step`, `ms`.
+*Le run.* `run_ts` (démarrage), `host`, `gomaxprocs`, `go_version`, `git_commit` (avec un `+` final
+si l'arbre était sale). Un fichier qui s'accumule sur des semaines n'est pas relisible sans eux —
+et les temps, eux, dépendent de la machine.
+
+*Ce qui a été lancé.* `logn`, `k`, `slots`, `blocks`, `seed`, `rounds`, `subbytes`, `xor`, `clean`,
+`cleandepth`, `place`, `extract`, `extractlv`.
+
+*La chaîne.* `logscale`, `primes` (leur nombre), `logq0`, `logq`, `logp`, `logqp`, `dnum`,
+`digit_bits` (le plus large paquet de `#P` primes consécutives), `marge` (`logp − digit_bits`,
+ce qui reste au-dessus du bruit de key-switch), `q_sizes` et `p_sizes` (les tailles, arrondies),
+et `chain_id`. Ce dernier hache les primes **elles-mêmes** : changer la taille d'une seule prime
+fait servir au générateur une autre prime à tous les niveaux en dessous, et ça vaut des bits de
+précision. Deux lignes partagent un `chain_id` si et seulement si elles ont tourné sur la même
+chaîne.
+
+*Le secret et le bootstrap.* `h` (poids de Hamming du secret), `h_tilde` (celui du secret
+éphémère), `s2c_levels` et `c2s_levels` (le découpage des deux DFT), `mod1_type`, `mod1_deg`,
+`mod1_k`, `logmsgratio`.
+
+*Les clefs.* `galois_keys` (leur nombre, que le découpage du SlotsToCoeffs fait varier d'un facteur
+3), `key_gb`, `keygen_ms`, `dft_ms` (l'encodage des matrices DFT, qui n'est pas de la génération de
+clefs et coûte plus qu'elle).
+
+*Où le pipeline se pose.* `refresh_lv`, `ark_lv`.
+
+Position et coût : `seq` (l'ordre d'exécution), `round`, `step`, `ms` (la durée de l'opération) et
+`elapsed_ms` (leur somme courante). Ces deux abscisses ne disent pas la même chose : `seq` compte
+des opérations, et deux configurations qui n'en font pas le même nombre — `XorClean` en fusionne
+deux — ne s'y comparent pas. `elapsed_ms` est le coût du **pipeline seul** : le chronomètre du run
+porte en plus les traces d'oracle, qui ne sont pas du calcul homomorphe.
 
 Résultat : `level`, `prec_avg`, `prec_min`, `worst_err`, `slots_pooled`, `bit_err`, `blocks_wrong`.
 

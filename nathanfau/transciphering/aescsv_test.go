@@ -1,17 +1,23 @@
 package transciphering
 
 import (
+	"encoding/binary"
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tuneinsight/lattigo/v6/circuits/ckks/mod1"
 )
 
 // One row per operation of a TestAES run, APPENDED to -csv.
@@ -25,28 +31,45 @@ import (
 
 var csvFlag = flag.String("csv", "", "append one row per operation of TestAES to this file: parameters, timing, and the precision pooled over all 64 ciphertexts")
 
-var csvHeader = []string{
-	// which run
-	"run_ts",
+// csvRunHeader is what every row repeats: the run, and everything that defines what it ran on.
+// csvRowHeader is what each operation adds. Splitting them lets newAESCSV check the widths match
+// BEFORE the run starts, rather than discovering it when the rows are written at the end.
+var csvRunHeader = []string{
+	// which run, from which tree, on which machine
+	"run_ts", "host", "gomaxprocs", "go_version", "git_commit",
 	// what was run
 	"logn", "k", "slots", "blocks", "seed", "rounds",
 	"subbytes", "xor", "clean", "cleandepth", "place", "extract", "extractlv",
-	"primes", "logscale", "refresh_lv", "ark_lv",
+	// the moduli chain
+	"logscale", "primes", "logq0", "logq", "logp", "logqp",
+	"dnum", "digit_bits", "marge", "q_sizes", "p_sizes", "chain_id",
+	// the secret and the bootstrapping circuit
+	"h", "h_tilde", "s2c_levels", "c2s_levels", "mod1_type", "mod1_deg", "mod1_k", "logmsgratio",
+	// what the keys cost
+	"galois_keys", "key_gb", "keygen_ms", "dft_ms",
+	// where the pipeline sits on the chain
+	"refresh_lv", "ark_lv",
+}
+
+var csvRowHeader = []string{
 	// where in the run
 	"seq", "round", "step",
 	// what it cost
-	"ms",
+	"ms", "elapsed_ms",
 	// what came out
 	"level", "prec_avg", "prec_min", "worst_err", "slots_pooled", "bit_err", "blocks_wrong",
 }
 
+var csvHeader = append(append([]string{}, csvRunHeader...), csvRowHeader...)
+
 // aesCSV accumulates the rows and writes them once, at the end: a run that dies mid-way still
 // leaves nothing half-written to misread later.
 type aesCSV struct {
-	path string
-	run  []string // the parameter columns, identical on every row
-	rows [][]string
-	seq  int
+	path    string
+	run     []string // the parameter columns, identical on every row
+	rows    [][]string
+	seq     int
+	elapsed time.Duration // the operations so far, which is NOT the wall clock: see add
 }
 
 // newAESCSV also checks, before anything is computed, that the file can be appended to: finding out
@@ -64,31 +87,58 @@ func newAESCSV(path string, ctx *Context, cfg Config, logN, k, blocks, rounds in
 	if _, err := csvIsFresh(path); err != nil {
 		return nil, err
 	}
-	extractLv := cfg.ExtractLevels(k)
-	return &aesCSV{
-		path: path,
-		run: []string{
-			time.Now().Format(time.RFC3339),
-			itoa(logN), itoa(k), itoa(ctx.Sw.CiP.MaxSlots()), itoa(blocks), strconv.FormatInt(seed, 10), itoa(rounds),
-			itoa(*sbVersion), cfg.Xor.String(), cfg.Clean.String(), itoa(cfg.Clean.Depth()),
-			cfg.Place.String(), extractName(cfg), itoa(extractLv),
-			itoa(ctx.Params.MaxLevel() + 1), itoa(ctx.Params.LogDefaultScale()),
-			itoa(ctx.RefreshLv), itoa(ctx.ARKLv),
-		},
-	}, nil
+	p, btp := ctx.Params, ctx.Eval.Parameters
+	Q, P := p.Q(), p.P()
+	mod1P := btp.Mod1ParametersLiteral
+	digit := widestDigit(Q, len(P))
+	run := []string{
+		time.Now().Format(time.RFC3339), hostname(), itoa(runtime.GOMAXPROCS(0)), runtime.Version(), gitCommit(),
+
+		itoa(logN), itoa(k), itoa(ctx.Sw.CiP.MaxSlots()), itoa(blocks), strconv.FormatInt(seed, 10), itoa(rounds),
+
+		itoa(*sbVersion), cfg.Xor.String(), cfg.Clean.String(), itoa(cfg.Clean.Depth()),
+		cfg.Place.String(), extractName(cfg), itoa(cfg.ExtractLevels(k)),
+
+		itoa(p.LogDefaultScale()), itoa(len(Q)), itoa(sizeOf(Q[0])),
+		ftoa(p.LogQ(), 1), ftoa(p.LogP(), 1), ftoa(p.LogQP(), 1),
+
+		itoa(p.BaseRNSDecompositionVectorSize(p.MaxLevel(), p.MaxLevelP())),
+		ftoa(digit, 1), ftoa(p.LogP()-digit, 1), chainSizes(Q), chainSizes(P), chainID(Q, P),
+
+		itoa(p.XsHammingWeight()), itoa(btp.EphemeralSecretWeight),
+		joinInts(btp.SlotsToCoeffsParameters.Levels), joinInts(btp.CoeffsToSlotsParameters.Levels),
+		mod1Name(mod1P.Mod1Type), itoa(mod1P.Mod1Degree), itoa(mod1P.K), itoa(mod1P.LogMessageRatio),
+
+		itoa(len(btp.GaloisElements(p))),
+		ftoa(float64(ctx.BtpKeyBytes+ctx.SwKeyBytes)/(1<<30), 3),
+		ftoa(millis(ctx.BtpKeyGen+ctx.SwKeyGen), 1), ftoa(millis(ctx.EvalSetup), 1),
+
+		itoa(ctx.RefreshLv), itoa(ctx.ARKLv),
+	}
+	if len(run) != len(csvRunHeader) {
+		return nil, fmt.Errorf("csv: %d run values for %d run columns", len(run), len(csvRunHeader))
+	}
+	return &aesCSV{path: path, run: run}, nil
 }
 
 // add records one operation. prec.WorstBit is a distance, so prec_min is its -log2: the MINIMUM
 // precision over the pool, the number that decides whether a bit is about to flip.
+//
+// elapsed_ms is the running sum of the operations, i.e. what the PIPELINE has cost when this
+// precision is reached -- not the wall clock, which also carries the oracle traces between the
+// operations. That is the x of a precision-against-cost plot: two configurations that spend a
+// different number of operations are only comparable on the time they spend.
 func (c *aesCSV) add(round int, step string, dur time.Duration, prec precSummary) {
 	if c == nil {
 		return
 	}
 	c.seq++
+	c.elapsed += dur
 	row := append([]string{}, c.run...)
 	row = append(row,
 		itoa(c.seq), itoa(round), step,
 		ftoa(float64(dur.Microseconds())/1000, 3),
+		ftoa(float64(c.elapsed.Microseconds())/1000, 3),
 		itoa(prec.Level), ftoa(prec.AvgPrec, 3), ftoa(negLog2(prec.WorstBit), 3), ftoa(prec.WorstBit, 6),
 		itoa(prec.Slots), ftoa(prec.BitErr, 6), itoa(prec.Wrong))
 	c.rows = append(c.rows, row)
@@ -169,6 +219,89 @@ func csvIsFresh(path string) (bool, error) {
 }
 
 func itoa(v int) string { return strconv.Itoa(v) }
+
+func millis(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
+
+func joinInts(v []int) string {
+	s := make([]string, len(v))
+	for i, x := range v {
+		s[i] = itoa(x)
+	}
+	return strings.Join(s, " ")
+}
+
+// sizeOf is a prime's size in bits, ROUNDED: an NTT-friendly prime sits a hair above its power of
+// two, so its bit length is one more than the size it was asked for and reads as another prime.
+func sizeOf(q uint64) int { return int(math.Round(math.Log2(float64(q)))) }
+
+func chainSizes(mods []uint64) string {
+	s := make([]string, len(mods))
+	for i, q := range mods {
+		s[i] = itoa(sizeOf(q))
+	}
+	return strings.Join(s, " ")
+}
+
+// widestDigit is the largest key-switching digit, len(P) consecutive Q primes, measured on the
+// primes themselves: summing the rounded sizes under-reports it by a few bits, and those are the
+// bits of margin against the key-switch noise.
+func widestDigit(Q []uint64, nbPi int) (best float64) {
+	for i := 0; i+nbPi <= len(Q); i++ {
+		var s float64
+		for j := i; j < i+nbPi; j++ {
+			s += math.Log2(float64(Q[j]))
+		}
+		best = math.Max(best, s)
+	}
+	return best
+}
+
+// chainID identifies the primes themselves, which their sizes do not: change the size of any one
+// of them and the generator hands a DIFFERENT prime to every level below, which alone moves the
+// precision by bits. Two rows share a chain_id iff they ran on the same chain.
+func chainID(Q, P []uint64) string {
+	h := fnv.New64a()
+	var b [8]byte
+	for _, m := range append(append([]uint64{}, Q...), P...) {
+		binary.LittleEndian.PutUint64(b[:], m)
+		h.Write(b[:])
+	}
+	return fmt.Sprintf("%08x", uint32(h.Sum64()))
+}
+
+func mod1Name(t mod1.Type) string {
+	switch t {
+	case mod1.CosDiscrete:
+		return "CosDiscrete"
+	case mod1.SinContinuous:
+		return "SinContinuous"
+	case mod1.CosContinuous:
+		return "CosContinuous"
+	}
+	return itoa(int(t))
+}
+
+func hostname() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return h
+}
+
+// gitCommit is the tree the run came from, with a trailing '+' when it was dirty, and empty when
+// git cannot say. A file that accumulates runs over weeks is unreadable without it.
+func gitCommit() string {
+	out, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	rev := strings.TrimSpace(string(out))
+	if st, err := exec.Command("git", "status", "--porcelain").Output(); err == nil && len(strings.TrimSpace(string(st))) > 0 {
+		rev += "+"
+	}
+	return rev
+}
 
 func ftoa(v float64, prec int) string {
 	if math.IsInf(v, 0) || math.IsNaN(v) {

@@ -5,7 +5,8 @@ Lit le CSV que `go test -run '^TestAES$' -csv <fichier>` écrit (une ligne par
 opération, plusieurs runs empilés dans le même fichier) et trace, sur UN seul
 graphique :
 
-  - en abscisse  : n, la n-ème opération du run (colonne `seq`)
+  - en abscisse  : le temps de pipeline cumulé (colonne `elapsed_ms`), ou le rang de
+                   l'opération avec --x seq
   - en ordonnée  : la précision en bits
   - une courbe   : `prec_min`, le pire slot de tous les blocs (--avg ajoute la moyenne
                    en pointillés)
@@ -42,8 +43,10 @@ FLOOR = -5.0
 # Ce qui définit une CONFIGURATION. `seed` en est exclue : sans -seed elle est tirée de l'horloge,
 # donc elle diffère à chaque run sans que rien de la configuration n'ait changé. Le label de légende
 # est construit sur les colonnes qui DIFFÈRENT entre les configurations retenues.
+# `chain_id` identifie les primes elles-memes : deux chaines de memes TAILLES mais dont une prime
+# a change plus bas ne portent pas les memes primes, et ca vaut des bits de precision.
 CONFIG = ["logn", "k", "blocks", "rounds", "subbytes", "xor", "clean",
-          "cleandepth", "place", "extract", "extractlv", "primes"]
+          "cleandepth", "place", "extract", "extractlv", "primes", "chain_id"]
 
 
 def pick_runs(df, keep_all):
@@ -92,19 +95,38 @@ def run_labels(df):
     return full, short
 
 
-def round_marks(df, gap=2):
-    """Le `seq` où chaque tour commence. Le tour 0 n'a qu'une opération, donc son séparateur
-    tomberait sur celui du tour 1 : on ne garde que les marques assez espacées pour être lues."""
+def add_x(df, mode):
+    """Pose la colonne d'abscisse `_x`, le début de l'opération `_x0`, et rend le libellé de l'axe.
+
+    En temps, l'abscisse est le cumul des durées d'opération, donc le coût du PIPELINE seul : le
+    chronomètre du run porte en plus les traces d'oracle, qui ne sont pas du calcul homomorphe.
+    C'est la seule abscisse sur laquelle deux configurations qui ne font pas le même nombre
+    d'opérations se comparent."""
+    if mode == "seq":
+        df["_x"] = df.seq.astype(float)
+        df["_x0"] = df._x - 0.5  # le separateur de tour tombe ENTRE deux operations
+        return "n — n-ème opération du run"
+    scale, unit = (1 / 60_000, "min") if df.elapsed_ms.max() > 900_000 else (1 / 1000, "s")
+    df["_x"] = df.elapsed_ms * scale
+    df["_x0"] = df._x - df.ms * scale  # le debut de l'operation, i.e. la fin de la precedente
+    return f"temps de pipeline cumulé ({unit})"
+
+
+def round_marks(df, gap=0.04):
+    """L'abscisse où chaque tour commence. Le tour 0 n'a qu'une opération, donc son séparateur
+    tomberait sur celui du tour 1 : on ne garde que les marques assez espacées pour être lues,
+    le seuil étant une fraction de la largeur du graphique."""
     one = df[df.run_ts == df.run_ts.iloc[0]].sort_values("seq")
     starts, prev_round = [], None
     for _, r in one.iterrows():
         if r["round"] != prev_round:
-            starts.append((int(r["seq"]), int(r["round"])))
+            starts.append((float(r["_x0"]), int(r["round"])))
             prev_round = r["round"]
     # De deux marques trop proches on garde la SECONDE : le tour 0 n'a qu'une operation, et c'est
     # le debut du tour 1 qui interesse.
+    span = float(one._x.max() - one._x.min()) or 1.0
     return [m for i, m in enumerate(starts)
-            if i + 1 == len(starts) or starts[i + 1][0] - m[0] >= gap]
+            if i + 1 == len(starts) or starts[i + 1][0] - m[0] >= gap * span]
 
 
 def draw(df, args, where):
@@ -122,27 +144,29 @@ def draw(df, args, where):
     fig, ax = plt.subplots(figsize=(11, 5.8), facecolor=SURFACE)
     ax.set_facecolor(SURFACE)
 
-    # Séparateurs de tours, derrière les données et volontairement discrets : l'axe des x compte
-    # des opérations, mais c'est par tour qu'on lit une dégradation.
-    for seq, rnd in round_marks(df):
-        ax.axvline(seq - 0.5, color=GRID, lw=1, zorder=0)
-        ax.annotate(f"T{rnd}", xy=(seq - 0.5, 1.005), xycoords=("data", "axes fraction"),
-                    color=INK_MUTED, fontsize=7.5, ha="left", va="bottom")
+    # Séparateurs de tours, derrière les données et volontairement discrets : c'est par tour qu'on
+    # lit une dégradation. En temps ils ne valent que pour UN run : deux configurations n'arrivent
+    # pas au tour 5 au même instant, et une grille tiree du premier run mentirait sur les autres.
+    if args.x == "seq" or len(runs) == 1:
+        for x0, rnd in round_marks(df):
+            ax.axvline(x0, color=GRID, lw=1, zorder=0)
+            ax.annotate(f"T{rnd}", xy=(x0, 1.005), xycoords=("data", "axes fraction"),
+                        color=INK_MUTED, fontsize=7.5, ha="left", va="bottom")
 
     ends = []
     for i, ts in enumerate(runs):
         color = SERIES[i]
         d = df[df.run_ts == ts].sort_values("seq")
-        ax.plot(d.seq, d.prec_min, color=color, lw=2, zorder=3)
+        ax.plot(d._x, d.prec_min, color=color, lw=2, zorder=3)
         if args.avg:
-            ax.plot(d.seq, d.prec_avg, color=color, lw=2, ls=(0, (2, 2)), zorder=3)
+            ax.plot(d._x, d.prec_avg, color=color, lw=2, ls=(0, (2, 2)), zorder=3)
 
         # Étiquette directe en bout de courbe : l'identité ne repose jamais sur la seule couleur,
         # et trois des huit teintes passent sous 3:1 sur fond clair.
         last = d.dropna(subset=["prec_min"]).iloc[-1]
-        ends.append((float(last.prec_min), float(last.seq), color, short[ts]))
+        ends.append((float(last.prec_min), float(last._x), color, short[ts]))
 
-    ax.set_xlabel("n — n-ème opération du run", color=INK_MUTED, fontsize=9.5)
+    ax.set_xlabel(args.xlabel, color=INK_MUTED, fontsize=9.5)
     ax.set_ylabel("précision du pire slot (bits)" if not args.avg else "précision (bits)",
                   color=INK_MUTED, fontsize=9.5)
     title = args.title or "Précision le long d'un AES-128 homomorphe"
@@ -183,11 +207,14 @@ def draw(df, args, where):
         ax.annotate(f"  {tag}", xy=(x, y), color=INK_MUTED, fontsize=9,
                     va="center", ha="left", zorder=4, annotation_clip=False)
 
-    # Place pour les etiquettes de bout de courbe, mesuree sur la plus longue. Les graduations,
-    # elles, s'arretent aux donnees : une marge n'est pas une plage de valeurs.
-    pad = 0.75 * max(len(s) for s in short.values()) + 2
-    ax.set_xlim(df.seq.min() - 1, df.seq.max() + pad)
-    ax.set_xticks([t for t in ax.get_xticks() if df.seq.min() <= t <= df.seq.max()])
+    # Place pour les etiquettes de bout de courbe, mesuree sur la plus longue et rapportee a la
+    # largeur des donnees : en secondes comme en rangs d'operation. Les graduations, elles,
+    # s'arretent aux donnees : une marge n'est pas une plage de valeurs.
+    lo, hi = float(df._x.min()), float(df._x.max())
+    span = (hi - lo) or 1.0
+    pad = span * (0.012 * max(len(s) for s in short.values()) + 0.02)
+    ax.set_xlim(lo - 0.02 * span, hi + pad)
+    ax.set_xticks([t for t in ax.get_xticks() if lo <= t <= hi])
 
     # Deux légendes, SOUS les axes : la couleur dit quel run, le style de trait quelle statistique.
     # Hors du cadre, elles ne peuvent pas recouvrir une courbe, quelle que soit l'allure des données.
@@ -212,7 +239,7 @@ def draw(df, args, where):
         # Les valeurs des colonnes portent des espaces et des parentheses -- "sq ((x-y)^2)" --
         # qu'un nom de fichier ne doit pas heriter.
         suffix = "".join("-" + re.sub(r"[^0-9A-Za-z]+", "", w) for w in where)
-        out = args.csv.rsplit(".", 1)[0] + suffix + ".png"
+        out = args.stem + suffix + ".png"
     fig.savefig(out, dpi=args.dpi, facecolor=SURFACE, bbox_inches="tight")
     plt.close(fig)
     print(f"{len(runs)} run(s), {len(df)} lignes -> {out}")
@@ -225,7 +252,9 @@ def draw(df, args, where):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv", default="runs/aes.csv")
+    ap.add_argument("--csv", action="append", default=None, metavar="FICHIER",
+                    help="repetable : plusieurs CSV sont reunis, et une colonne `source` (le nom "
+                         "du fichier) distingue leurs runs. Defaut runs/aes.csv")
     ap.add_argument("--out", default=None,
                     help="PNG de sortie (defaut : le nom du CSV, plus les filtres). Incompatible avec --split")
     ap.add_argument("--dpi", type=int, default=160)
@@ -234,6 +263,10 @@ def main():
     ap.add_argument("--split", default="logn", metavar="COL",
                     help="un PNG par valeur de COL trouvee dans le CSV. Defaut logn : deux degres "
                          "d'anneau ne se comparent pas sur un meme axe. 'none' pour tout reunir")
+    ap.add_argument("--x", choices=("time", "seq"), default="time",
+                    help="abscisse : 'time' le temps de pipeline cumule (defaut), 'seq' le rang "
+                         "de l'operation. Deux configurations qui ne font pas le meme nombre "
+                         "d'operations ne se comparent qu'en temps")
     ap.add_argument("--title", default=None, help="titre du graphique")
     ap.add_argument("--avg", action="store_true",
                     help="tracer aussi prec_avg, en pointilles (par defaut seul le pire slot)")
@@ -244,9 +277,37 @@ def main():
     if args.split not in ("", "none") and args.out:
         sys.exit("--split ecrit plusieurs PNG, il ne peut pas partager un seul --out")
 
-    df = pd.read_csv(args.csv)
-    if df.empty:
-        sys.exit(f"{args.csv} : aucune ligne")
+    args.csv = args.csv or ["runs/aes.csv"]
+    args.stem = args.csv[0].rsplit(".", 1)[0]
+
+    # Plusieurs fichiers se reunissent sur l'union de leurs colonnes : les jeux de colonnes ont
+    # change dans le temps, et un CSV ancien n'a pas a etre exclu pour autant.
+    parts = []
+    for path in args.csv:
+        d = pd.read_csv(path)
+        if d.empty:
+            sys.exit(f"{path} : aucune ligne")
+        if len(args.csv) > 1:
+            d["source"] = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        parts.append(d)
+    df = pd.concat(parts, ignore_index=True)
+    # En TETE de CONFIG : l'etiquette courte prend les premieres colonnes qui separent, et le nom
+    # du fichier se lit ou un chain_id en hexadecimal ne se lit pas.
+    if len(args.csv) > 1 and "source" not in CONFIG:
+        CONFIG.insert(0, "source")
+    # Les jeux de colonnes ont change dans le temps. Une colonne de CONFIG que le fichier n'a pas
+    # du tout fait echouer le groupby de pick_runs ; presente dans un fichier et pas dans l'autre,
+    # elle vaut NaN, et un groupby laisse alors tomber ces lignes sans un mot. Dans les deux cas
+    # elle vaut "?", ce qui ne separe rien et ne casse rien.
+    for c in CONFIG:
+        df[c] = df[c].fillna("?") if c in df.columns else "?"
+
+    # Les CSV ecrits avant la colonne `elapsed_ms` la retrouvent exactement : elle EST la somme
+    # courante des durees d'operation du run.
+    if "elapsed_ms" not in df.columns:
+        df["elapsed_ms"] = float("nan")
+    df["elapsed_ms"] = df.elapsed_ms.fillna(df.groupby("run_ts").ms.cumsum())
+    args.xlabel = add_x(df, args.x)
 
     for w in args.where:
         col, _, val = w.partition("=")
