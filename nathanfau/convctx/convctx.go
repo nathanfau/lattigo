@@ -26,6 +26,11 @@ type CtxSwitcher struct {
 	SkBig   *rlwe.SecretKey // iota(SkSmall), not an independent key
 	SkSmall *rlwe.SecretKey
 
+	// KeyBytes is the serialized size of the three switching keys built below (the two ring-swap
+	// keys, of degree 2N, and the CI relinearization key). It is measured here because the keys
+	// themselves are private; a P sweep needs it.
+	KeyBytes int
+
 	nHalf int
 
 	EvalCI *ckks.Evaluator
@@ -40,11 +45,18 @@ type CtxSwitcher struct {
 	autRot  []uint64 // sigma_{2N+1}, the N/2-slot rotation, as a coefficient permutation
 	autConj []uint64 // sigma_{-1}, the conjugation, as a coefficient permutation
 
-	// One mask per level, encoded at that level's rescaling factor so a conversion does not move
-	// the scale. Built on demand by maskAt.
+	// One mask per level and per scale hop, encoded at that level's rescaling factor times the hop
+	// so a conversion multiplies the scale by exactly the hop, 1 unless asked. Built on demand by
+	// maskAt.
 	ecdBig  *ckks.Encoder
-	ptMask1 map[int]*rlwe.Plaintext // [1.., i..]
-	ptMask2 map[int]*rlwe.Plaintext // [1.., -i..]
+	ptMask1 map[maskKey]*rlwe.Plaintext // [1.., i..]
+	ptMask2 map[maskKey]*rlwe.Plaintext // [1.., -i..]
+}
+
+// maskKey identifies a cached mask: its level, and its scale hop written out exactly.
+type maskKey struct {
+	lvl int
+	hop string
 }
 
 // NewCtxSwitcher builds the machinery around a Std deg-N ring (typically the bootstrapping
@@ -112,22 +124,25 @@ func NewCtxSwitcher(stdSmallP ckks.Parameters, skSmall *rlwe.SecretKey) (*CtxSwi
 	rlkCI := rlwe.NewKeyGenerator(c.CiP).GenRelinearizationKeyNew(c.SkCI)
 	c.EvalCI = ckks.NewEvaluator(c.CiP, rlwe.NewMemEvaluationKeySet(rlkCI))
 
+	c.KeyBytes = evkC2R.BinarySize() + evkR2C.BinarySize() + rlkCI.BinarySize()
+
 	c.ecdBig = ckks.NewEncoder(c.StdBigP)
-	c.ptMask1 = map[int]*rlwe.Plaintext{}
-	c.ptMask2 = map[int]*rlwe.Plaintext{}
+	c.ptMask1 = map[maskKey]*rlwe.Plaintext{}
+	c.ptMask2 = map[maskKey]*rlwe.Plaintext{}
 
 	return c, nil
 }
 
 // maskAt returns the mask of Fig. 1 step (2), or of Fig. 2 step (3) when second, for a ciphertext
-// at level lvl.
-func (c *CtxSwitcher) maskAt(lvl int, second bool) (*rlwe.Plaintext, error) {
+// at level lvl, encoded so that the conversion multiplies the scale by hop.
+func (c *CtxSwitcher) maskAt(lvl int, second bool, hop rlwe.Scale) (*rlwe.Plaintext, error) {
 
 	cache := c.ptMask1
 	if second {
 		cache = c.ptMask2
 	}
-	if pt, ok := cache[lvl]; ok {
+	key := maskKey{lvl, hop.Value.Text('p', 0)}
+	if pt, ok := cache[key]; ok {
 		return pt, nil
 	}
 
@@ -145,8 +160,8 @@ func (c *CtxSwitcher) maskAt(lvl int, second bool) (*rlwe.Plaintext, error) {
 		m[i] = v
 	}
 
-	// At what Rescale will divide by, so the conversion does not move the scale.
-	scale := utils.RescalingFactor(c.StdBigP, lvl)
+	// At what Rescale will divide by, so the conversion does not move the scale, times the hop.
+	scale := utils.RescalingFactor(c.StdBigP, lvl).Mul(hop)
 	if second {
 		scale = scale.Div(rlwe.NewScale(2))
 	}
@@ -156,12 +171,19 @@ func (c *CtxSwitcher) maskAt(lvl int, second bool) (*rlwe.Plaintext, error) {
 	if err := c.ecdBig.Encode(m, pt); err != nil {
 		return nil, fmt.Errorf("encode mask (second=%t) at level %d: %w", second, lvl, err)
 	}
-	cache[lvl] = pt
+	cache[key] = pt
 	return pt, nil
 }
 
 // CIToStandard is Fig. 1
 func (c *CtxSwitcher) CIToStandard(ctCI *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+	return c.CIToStandardTo(ctCI, ctCI.Scale)
+}
+
+// CIToStandardTo is CIToStandard landing on the scale out instead of on ctCI's own. The mask is a
+// plaintext, so it can be encoded at whatever scale makes the Rescale land on out: a free scale
+// hop, which is how a ciphertext leaves a zone of smaller primes for the bootstrap.
+func (c *CtxSwitcher) CIToStandardTo(ctCI *rlwe.Ciphertext, out rlwe.Scale) (*rlwe.Ciphertext, error) {
 
 	if ctCI.Level() < 1 {
 		return nil, fmt.Errorf("CIToStandard: input at level %d, the masking needs a prime to rescale", ctCI.Level())
@@ -172,7 +194,7 @@ func (c *CtxSwitcher) CIToStandard(ctCI *rlwe.Ciphertext) (*rlwe.Ciphertext, err
 		return nil, fmt.Errorf("RealToComplex: %w", err)
 	}
 
-	pt, err := c.maskAt(ctBig.Level(), false)
+	pt, err := c.maskAt(ctBig.Level(), false, out.Div(ctCI.Scale))
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +234,7 @@ func (c *CtxSwitcher) StandardToCI(ctStd *rlwe.Ciphertext) (*rlwe.Ciphertext, er
 		return nil, fmt.Errorf("key switch iota(s) -> s~: %w", err)
 	}
 
-	pt, err := c.maskAt(ctBig.Level(), true)
+	pt, err := c.maskAt(ctBig.Level(), true, rlwe.NewScale(1))
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +254,7 @@ func (c *CtxSwitcher) StandardToCI(ctStd *rlwe.Ciphertext) (*rlwe.Ciphertext, er
 	*ctCI.MetaData = *ctBig.MetaData
 	ctCI.LogDimensions = c.CiP.LogMaxDimensions()
 
-	// FLAG SCALE. The fold doubled the encoded value, so the scale doubles with it.
+	// The fold doubled the encoded value, so the scale doubles with it.
 	ctCI.Scale = ctBig.Scale.Mul(rlwe.NewScale(2))
 	return ctCI, nil
 }
