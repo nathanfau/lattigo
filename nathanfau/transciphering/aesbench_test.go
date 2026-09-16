@@ -14,13 +14,18 @@ import (
 
 	"github.com/tuneinsight/lattigo/v6/nathanfau/aes"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/blockpack"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/params2"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 )
 
-// csvBenchRowHeader is what a bench run adds to the parameter columns: the two chronos and the
-// state as the oracle found it, once, at the end. kg_ms is the whole key generation, i.e. the
-// keygen_ms and dft_ms columns plus the encryption of the key schedule.
+// csvBenchRowHeader is what a bench run adds to the parameter columns: the two chronos, the memory,
+// and the state as the oracle found it, once, at the end. kg_ms is the whole key generation, i.e.
+// the keygen_ms and dft_ms columns plus the encryption of the key schedule. live_gb is the live heap
+// once the keys are ready, peak_rss_gb the most the process ever held over the run. Sizes are in Go,
+// 1 Go = 2^30 octets, like key_gb.
 var csvBenchRowHeader = []string{
 	"kg_ms", "transcipher_ms", "ms_per_block",
+	"live_gb", "peak_rss_gb",
 	"level", "prec_avg", "prec_min", "worst_err", "slots_pooled", "bit_err", "blocks_wrong",
 }
 
@@ -37,7 +42,7 @@ func TestAESBench(t *testing.T) {
 		t.Skip("full AES: 10 rounds, several minutes")
 	}
 
-	cfg := config(t)
+	cfg, sh := config(t), shape(t)
 	seed := blockSeed()
 	// The csv path is checked BEFORE the keys, so a bad path or a file with older columns fails in
 	// a second instead of at the end of the run.
@@ -49,13 +54,13 @@ func TestAESBench(t *testing.T) {
 	rk := aes.KeyExpansion(key[:])
 	last := len(rk) - 1 // round 0 is the initial ARK, the last one has no MixColumns
 
-	fmt.Printf(" AES-128 bench: SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, logN=%d, random seed = %d \n",
-		*sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), logN, seed)
+	fmt.Printf(" AES-128 bench: SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, STC=%s, logN=%d, random seed = %d \n",
+		*sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), params2.FormatLogSTC(sh.LogSTC), logN, seed)
 
 	// KeyGen: everything done once per key, i.e. the FHE keys and the key schedule encrypted at the
 	// three levels the pipeline takes it at.
 	tKG := time.Now()
-	ctx, err := NewContextWith(logN, k, cfg)
+	ctx, err := NewContextWith2(logN, k, cfg, sh)
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -69,9 +74,11 @@ func TestAESBench(t *testing.T) {
 	}
 	rkHE[last] = encRK(t, ctx, rk[last], nBlocks, ctx.LastKeyLv)
 	dKG := time.Since(tKG)
-	fmt.Printf("KeyGen done in %s (bootstrapping %s, switcher %s, DFT matrices %s, key material %.2f GB)\n",
+	fmt.Printf("KeyGen done in %s (bootstrapping %s, switcher %s, DFT matrices %s, key material %s)\n",
 		dKG.Round(time.Millisecond), ctx.BtpKeyGen.Round(time.Millisecond), ctx.SwKeyGen.Round(time.Millisecond),
-		ctx.EvalSetup.Round(time.Millisecond), float64(ctx.BtpKeyBytes+ctx.SwKeyBytes)/(1<<30))
+		ctx.EvalSetup.Round(time.Millisecond), utils.Bytes(uint64(ctx.BtpKeyBytes+ctx.SwKeyBytes)))
+	// Between the chronos: the table collects.
+	live := memTable("after KeyGen", ctx, packedItem("round keys", rkHE...))
 
 	blocks := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
 
@@ -92,14 +99,17 @@ func TestAESBench(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Round T%d: %v", r, err)
 		}
-		fmt.Printf("  round %2d/%d done in %s (elapsed %s, level %d)\n",
-			r, last, time.Since(tRound).Round(time.Millisecond), time.Since(tTC).Round(time.Millisecond), st[0][0].Level())
+		fmt.Printf("  round %2d/%d done in %s (elapsed %s, level %d) | %s\n",
+			r, last, time.Since(tRound).Round(time.Millisecond), time.Since(tTC).Round(time.Millisecond), st[0][0].Level(), utils.Mem())
 	}
 	dTC := time.Since(tTC)
 
+	memTable("after the rounds", ctx, packedItem("round keys", rkHE...), packedItem("state", st))
+	peak := utils.Mem().PeakRSS
 	fmt.Printf("KeyGen         : %s\n", dKG.Round(time.Millisecond))
 	fmt.Printf("Transciphering : %s  (%d blocks, %s per block)\n",
 		dTC.Round(time.Millisecond), nBlocks, (dTC / time.Duration(nBlocks)).Round(time.Microsecond))
+	fmt.Printf("Memory         : live %s after KeyGen, peak RSS %s over the run\n", utils.Bytes(live), utils.Bytes(peak))
 
 	// The one oracle call: the whole cipher in the clear, then the state decrypted once.
 	want := aesRM(blocks, rk)
@@ -114,7 +124,7 @@ func TestAESBench(t *testing.T) {
 	if err != nil {
 		t.Errorf("%v", err)
 	}
-	rec.addBench(dKG, dTC, nBlocks, prec)
+	rec.addBench(dKG, dTC, nBlocks, live, peak, prec)
 	if err := rec.write(); err != nil {
 		t.Errorf("%v", err)
 	}
@@ -166,13 +176,15 @@ func newAESBenchCSV(path string, ctx *Context, cfg Config, logN, k, blocks, roun
 // addBench records the single row of a bench run. prec.WorstBit is a distance, so prec_min is its
 // -log2: the MINIMUM precision over the pool, the number that decides whether a bit is about to
 // flip.
-func (c *aesCSV) addBench(kg, tc time.Duration, blocks int, prec precSummary) {
+func (c *aesCSV) addBench(kg, tc time.Duration, blocks int, live, peak uint64, prec precSummary) {
 	if c == nil {
 		return
 	}
+	gb := func(b uint64) string { return ftoa(float64(b)/(1<<30), 3) }
 	row := append([]string{}, c.run...)
 	row = append(row,
 		ftoa(millis(kg), 3), ftoa(millis(tc), 3), ftoa(millis(tc)/float64(blocks), 3),
+		gb(live), gb(peak),
 		itoa(prec.Level), ftoa(prec.AvgPrec, 3), ftoa(negLog2(prec.WorstBit), 3), ftoa(prec.WorstBit, 6),
 		itoa(prec.Slots), ftoa(prec.BitErr, 6), itoa(prec.Wrong))
 	c.rows = append(c.rows, row)

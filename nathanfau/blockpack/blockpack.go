@@ -57,6 +57,16 @@ func (p Packed) Cts() []*rlwe.Ciphertext {
 	return cts
 }
 
+// BinarySize is the memory the 64 ciphertexts take, i.e. their serialized size.
+func (p Packed) BinarySize() (n int) {
+	for _, ct := range p.Cts() {
+		if ct != nil {
+			n += ct.BinarySize()
+		}
+	}
+	return n
+}
+
 // SlotVec builds the cleartext slot vector of ciphertext [g][b]: block s on slot s (low half) and
 // slot half+s (high half), unused slots left at zero. It is what Encrypt encodes.
 func SlotVec(params ckks.Parameters, blocks [][16]byte, g, b int) []float64 {

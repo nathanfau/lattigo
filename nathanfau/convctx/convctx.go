@@ -126,6 +126,18 @@ func NewCtxSwitcher(stdSmallP ckks.Parameters, skSmall *rlwe.SecretKey) (*CtxSwi
 	return c, nil
 }
 
+// MaskBytes is how many masks are cached and what they weigh. There is one per level a conversion
+// has run at, built on demand, so the figure grows during a run.
+func (c *CtxSwitcher) MaskBytes() (masks, bytes int) {
+	for _, cache := range []map[int]*rlwe.Plaintext{c.ptMask1, c.ptMask2} {
+		for _, pt := range cache {
+			masks++
+			bytes += pt.BinarySize()
+		}
+	}
+	return masks, bytes
+}
+
 // maskAt returns the mask of Fig. 1 step (2), or of Fig. 2 step (3) when second, for a ciphertext
 // at level lvl.
 func (c *CtxSwitcher) maskAt(lvl int, second bool) (*rlwe.Plaintext, error) {

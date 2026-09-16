@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
+	"github.com/tuneinsight/lattigo/v6/circuits/ckks/dft"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/aes"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/algo1"
@@ -159,8 +160,8 @@ func NewContextWith2(logN, k int, cfg Config, sh params2.Shape) (*Context, error
 	if err != nil {
 		return nil, fmt.Errorf("bootstrapping NewEvaluator: %w", err)
 	}
-	// NewEvaluator is not key generation: it encodes the two DFT matrices, plaintexts living in Q
-	// alone. It costs real time and does NOT move with P, so it is timed apart.
+	// NewEvaluator is not key generation: it encodes the two DFT matrices. It costs real time, so it
+	// is timed apart.
 	evalSetup := time.Since(t1)
 	fmt.Printf("Done !(%s, dont %s de matrices DFT)\n", time.Since(t0).Round(time.Millisecond), evalSetup.Round(time.Millisecond))
 
@@ -212,6 +213,76 @@ func NewContextWith2(logN, k int, cfg Config, sh params2.Shape) (*Context, error
 	debug.EncCI, debug.DecCI, debug.ParamsCI = c.EcdCI, c.DecCI, sw.CiP
 
 	return c, nil
+}
+
+// MemItem is one object a run keeps alive, and what it weighs.
+type MemItem struct {
+	Name  string
+	Count int
+	Bytes int
+}
+
+// MemBreakdown lists the big objects the context holds, weighed on the objects themselves (their
+// serialized size, which for lattigo's polynomials is their memory to a few bytes). What it does not
+// list -- evaluator buffers, encoders, ring tables, Go overhead -- is the gap to the live heap.
+func (c *Context) MemBreakdown() []MemItem {
+	var items []MemItem
+	add := func(name string, count, bytes int) {
+		if count > 0 {
+			items = append(items, MemItem{name, count, bytes})
+		}
+	}
+	evk := c.Eval.EvaluationKeys
+	n, b := evkSize(evk.EvkN1ToN2, evk.EvkN2ToN1, evk.EvkRealToCmplx, evk.EvkCmplxToReal)
+	add("btp ring-switch keys", n, b)
+	n, b = evkSize(evk.EvkDenseToSparse, evk.EvkSparseToDense)
+	add("btp sparse-secret keys", n, b)
+	if ks := evk.MemEvaluationKeySet; ks != nil {
+		if ks.RelinearizationKey != nil {
+			add("btp relinearization key", 1, ks.RelinearizationKey.BinarySize())
+		}
+		b = 0
+		for _, gk := range ks.GaloisKeys {
+			b += gk.BinarySize()
+		}
+		add("btp Galois keys", len(ks.GaloisKeys), b)
+	}
+	n, b = dftSize(c.Eval.S2CDFTMatrix)
+	add("DFT SlotsToCoeffs (QP)", n, b)
+	n, b = dftSize(c.Eval.C2SDFTMatrix)
+	add("DFT CoeffsToSlots (QP)", n, b)
+	add("switcher keys (deg 2N)", 3, c.Sw.KeyBytes)
+	n, b = c.Sw.MaskBytes()
+	add("switcher masks (deg 2N)", n, b)
+	return items
+}
+
+// DFTSize is the two DFT matrices: plaintext diagonals and bytes, SlotsToCoeffs then CoeffsToSlots.
+func (c *Context) DFTSize() (s2cPts, s2cBytes, c2sPts, c2sBytes int) {
+	s2cPts, s2cBytes = dftSize(c.Eval.S2CDFTMatrix)
+	c2sPts, c2sBytes = dftSize(c.Eval.C2SDFTMatrix)
+	return
+}
+
+func evkSize(keys ...*rlwe.EvaluationKey) (n, bytes int) {
+	for _, k := range keys {
+		if k != nil {
+			n++
+			bytes += k.BinarySize()
+		}
+	}
+	return n, bytes
+}
+
+// dftSize counts a DFT matrix's plaintext diagonals and their size.
+func dftSize(m dft.Matrix) (plaintexts, bytes int) {
+	for _, lt := range m.Matrices {
+		for _, p := range lt.Vec {
+			plaintexts++
+			bytes += p.BinarySize()
+		}
+	}
+	return plaintexts, bytes
 }
 
 // logf prints a progress line unless the context is Quiet.

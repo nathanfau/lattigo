@@ -6,6 +6,9 @@ package params2
 import (
 	"fmt"
 	"math/big"
+	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/dft"
@@ -80,6 +83,41 @@ type Shape struct {
 	LogSTC []int // sizes of the SlotsToCoeffs primes, one level each; nil = DefaultLogSTC
 	LogQ0  int   // size of the bottom prime; 0 = DefaultLogQ0. The message ratio follows it:
 	// LogMessageRatio = LogQ0 - LogScale, so 42 gives 2^4 and 38 gives 1.
+}
+
+// ParseLogSTC reads a SlotsToCoeffs shape the way the test flags write it: the prime sizes, "30,30",
+// or n equal primes, "2x30".
+func ParseLogSTC(s string) ([]int, error) {
+	s = strings.TrimSpace(s)
+	if n, b, ok := strings.Cut(s, "x"); ok {
+		count, err1 := strconv.Atoi(strings.TrimSpace(n))
+		bits, err2 := strconv.Atoi(strings.TrimSpace(b))
+		if err1 != nil || err2 != nil || count < 1 || bits < 1 {
+			return nil, fmt.Errorf("SlotsToCoeffs shape %q: want <count>x<bits>, e.g. 2x30", s)
+		}
+		return slices.Repeat([]int{bits}, count), nil
+	}
+	var logSTC []int
+	for _, f := range strings.Split(s, ",") {
+		b, err := strconv.Atoi(strings.TrimSpace(f))
+		if err != nil || b < 1 {
+			return nil, fmt.Errorf("SlotsToCoeffs shape %q: want prime sizes, e.g. 30,30, or 2x30", s)
+		}
+		logSTC = append(logSTC, b)
+	}
+	return logSTC, nil
+}
+
+// FormatLogSTC writes a shape the way ParseLogSTC reads it, "2x30" when its primes are all equal.
+func FormatLogSTC(logSTC []int) string {
+	if len(logSTC) > 1 && slices.Min(logSTC) == slices.Max(logSTC) {
+		return fmt.Sprintf("%dx%d", len(logSTC), logSTC[0])
+	}
+	s := make([]string, len(logSTC))
+	for i, b := range logSTC {
+		s[i] = strconv.Itoa(b)
+	}
+	return strings.Join(s, ",")
 }
 
 // TranscipheringParamsWith is the Algo1 pipeline parameter set (nathanfau/transciphering) on a

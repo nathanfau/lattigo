@@ -126,6 +126,16 @@ func (d MatrixLiteral) GaloisElements(params ckks.Parameters) (galEls []uint64) 
 	return params.GaloisElements(rotations)
 }
 
+// DiagonalCounts returns, for each matrix of the factorization, its number of non-zero diagonals,
+// i.e. how many plaintexts [NewMatrixFromLiteral] encodes for it. It only computes the index maps,
+// so it sizes the matrices of a large ring without generating them.
+func (d MatrixLiteral) DiagonalCounts(logN int) (counts []int) {
+	for _, m := range d.computeBootstrappingDFTIndexMap(logN) {
+		counts = append(counts, len(m))
+	}
+	return
+}
+
 // MarshalBinary returns a JSON representation of the the target [MatrixLiteral] on a slice of bytes.
 // See `Marshal` from the `encoding/json` package.
 func (d MatrixLiteral) MarshalBinary() (data []byte, err error) {

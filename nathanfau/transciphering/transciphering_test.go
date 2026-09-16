@@ -2,6 +2,7 @@ package transciphering
 
 //	go test ./nathanfau/transciphering/ -run '^TestTransciphering$' -v -subbytes 2 -rounds 1 -timeout 0
 //	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -subbytes 2 -timeout 0
+//	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -subbytes 2 -timeout 0 -stc 60
 
 import (
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"github.com/tuneinsight/lattigo/v6/nathanfau/blockpack"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/cleaning"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/debug"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/params2"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 )
 
@@ -26,6 +28,7 @@ var (
 	placeFlag   = flag.String("place", "after", `where the round cleaning lands: "after" (AddRoundKey then Cleaning), "both" (clean state and key, then XOR) or "one" (clean the state only, then XOR)`)
 	xtractFlag  = flag.Bool("cleanextract", false, "run the refresh on BitExtractClean (interpolation and cleaning fused, error quadratic in Algo1's output) instead of BitExtract (half spectrum, error linear); costs one prime more")
 	seedFlag    = flag.Int64("seed", 0, "seed of the block draw; 0 draws one from the clock")
+	stcFlag     = flag.String("stc", "2x30", `SlotsToCoeffs primes, one level each: "2x30" or "30,30"; "60" is the chain's historical single prime (one level, dense matrix, far too heavy at large logN)`)
 )
 
 // blockSeed fixes WHICH blocks the batch carries, so two configs can be compared on the same
@@ -56,6 +59,17 @@ func config(t *testing.T) Config {
 	return Config{Xor: xk, Clean: ck, Place: pk, CleanExtract: *xtractFlag}
 }
 
+// shape parses -stc, also before any keygen. Every level the tests use is read off the context,
+// which follows the extra levels a longer SlotsToCoeffs adds.
+func shape(t *testing.T) params2.Shape {
+	t.Helper()
+	logSTC, err := params2.ParseLogSTC(*stcFlag)
+	if err != nil {
+		t.Fatalf("-stc: %v", err)
+	}
+	return params2.Shape{LogSTC: logSTC}
+}
+
 // extractName is what the trace calls the extraction the config selected.
 func extractName(cfg Config) string {
 	if cfg.CleanExtract {
@@ -82,11 +96,11 @@ func TestTransciphering(t *testing.T) {
 	if n < 1 {
 		n = 1
 	}
-	cfg := config(t)
-	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s \n",
-		n, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg))
+	cfg, sh := config(t), shape(t)
+	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, STC=%s \n",
+		n, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), params2.FormatLogSTC(sh.LogSTC))
 
-	ctx, err := NewContextWith(logN, k, cfg)
+	ctx, err := NewContextWith2(logN, k, cfg, sh)
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -105,7 +119,7 @@ func TestTransciphering(t *testing.T) {
 		aes.AddRoundKey(states[bi][:], rk[0])
 	}
 
-	st, err := blockpack.Encrypt(ciP, ctx.EcdCI, ctx.EncCI, states, SubBytesLevel)
+	st, err := blockpack.Encrypt(ciP, ctx.EcdCI, ctx.EncCI, states, ctx.SubBytesLv)
 	if err != nil {
 		t.Fatalf("blockpack.Encrypt state: %v", err)
 	}
@@ -114,6 +128,7 @@ func TestTransciphering(t *testing.T) {
 	for r := 1; r <= n; r++ {
 		rkHE[r] = encRK(t, ctx, rk[r], len(states), ctx.ARKKeyLv)
 	}
+	memTable("before the rounds", ctx, packedItem("round keys", rkHE...), packedItem("state", st))
 
 	fmt.Println("================ input (entry to round 1) ================")
 	report(ctx, st, states, 0, "input")
@@ -153,7 +168,9 @@ func TestTransciphering(t *testing.T) {
 		dRound := time.Since(tRound)
 		times["Round"] = append(times["Round"], dRound)
 		fmt.Printf("  [T%d] round time (incl. oracle traces): %s\n", r, dRound.Round(time.Millisecond))
+		memLine(fmt.Sprintf("after T%d", r))
 	}
+	memTable("after the rounds", ctx, packedItem("round keys", rkHE...), packedItem("state", st))
 
 	fmt.Printf("\nTOTAL (%d rounds, incl. oracle traces): %s\n", n, time.Since(tGlobal).Round(time.Millisecond))
 	fmt.Println("================ timing stats (per round) ================")
@@ -191,9 +208,9 @@ func TestAES(t *testing.T) {
 		t.Skip("full AES: 10 rounds, several minutes")
 	}
 
-	cfg := config(t)
+	cfg, sh := config(t), shape(t)
 
-	ctx, err := NewContextWith(logN, k, cfg)
+	ctx, err := NewContextWith2(logN, k, cfg, sh)
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -206,8 +223,8 @@ func TestAES(t *testing.T) {
 
 	seed := blockSeed()
 	blocks := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
-	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, %d blocks, random seed = %d \n",
-		nMiddle, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), len(blocks), seed)
+	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, STC=%s, %d blocks, random seed = %d \n",
+		nMiddle, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), params2.FormatLogSTC(sh.LogSTC), len(blocks), seed)
 
 	rec, err := newAESCSV(*csvFlag, ctx, cfg, logN, k, len(blocks), nMiddle, seed)
 	if err != nil {
@@ -220,12 +237,13 @@ func TestAES(t *testing.T) {
 
 	// Three key levels: rk0 lands before SubBytes, the middle keys after MixColumns, the last one
 	// straight out of the refresh since no MixColumns eats into it.
-	rk0 := encRK(t, ctx, rk[0], len(blocks), InitLevel)
+	rk0 := encRK(t, ctx, rk[0], len(blocks), ctx.InitLv)
 	rkHE := make([]blockpack.Packed, len(rk))
 	for r := 1; r <= nMiddle; r++ {
 		rkHE[r] = encRK(t, ctx, rk[r], len(blocks), ctx.ARKKeyLv)
 	}
 	rkHE[len(rk)-1] = encRK(t, ctx, rk[len(rk)-1], len(blocks), ctx.LastKeyLv)
+	memTable("before the rounds", ctx, packedItem("round keys", append(rkHE, rk0)...))
 
 	times := map[string][]time.Duration{}
 	tGlobal := time.Now()
@@ -241,10 +259,11 @@ func TestAES(t *testing.T) {
 	for bi := range states {
 		aes.AddRoundKey(states[bi][:], rk[0])
 	}
-	if l := st[0][0].Level(); l != SubBytesLevel {
-		t.Errorf("FirstRound left the state at level %d, want SubBytesLevel %d", l, SubBytesLevel)
+	if l := st[0][0].Level(); l != ctx.SubBytesLv {
+		t.Errorf("FirstRound left the state at level %d, want the SubBytes level %d", l, ctx.SubBytesLv)
 	}
 	rec.add(0, "FirstRound", dFirst, report(ctx, st, states, 0, "FirstRound"))
+	memLine("after T0")
 
 	// round and rkNow name the round in flight, so the same hook serves the middle rounds and the
 	// last one. Refresh advances the oracle by ShiftRows: the bootstrap keeps the bit values, only
@@ -276,6 +295,7 @@ func TestAES(t *testing.T) {
 			t.Fatalf("Round T%d: %v", r, err)
 		}
 		times["Round"] = append(times["Round"], time.Since(tRound))
+		memLine(fmt.Sprintf("after T%d", r))
 	}
 
 	last := len(rk) - 1
@@ -286,6 +306,8 @@ func TestAES(t *testing.T) {
 		t.Fatalf("LastRoundV1: %v", err)
 	}
 	times["LastRound"] = append(times["LastRound"], time.Since(tRound))
+	memLine(fmt.Sprintf("after T%d", last))
+	memTable("after the rounds", ctx, packedItem("round keys", append(rkHE, rk0)...), packedItem("state", st))
 
 	fmt.Printf("\nTOTAL AES-128 (incl. oracle traces): %s\n", time.Since(tGlobal).Round(time.Millisecond))
 	fmt.Println("================ timing stats ================")
@@ -333,6 +355,50 @@ func encRK(t *testing.T, ctx *Context, rk []byte, blocks, level int) blockpack.P
 		t.Fatalf("encrypt round key at level %d: %v", level, err)
 	}
 	return p
+}
+
+// packedItem weighs packed states or round keys as one line of memTable; unset ones are skipped.
+func packedItem(name string, ps ...blockpack.Packed) MemItem {
+	it := MemItem{Name: name}
+	for _, p := range ps {
+		for _, ct := range p.Cts() {
+			if ct != nil {
+				it.Count++
+			}
+		}
+		it.Bytes += p.BinarySize()
+	}
+	return it
+}
+
+// memTable prints what the run keeps alive, object by object, against the live heap, and returns
+// that heap. The gap is what no object reports: evaluator buffers, encoders, ring tables, Go
+// overhead. Two tables of one run that differ in live heap beyond the listed objects point at
+// something the rounds retain. It collects, so keep it out of timed sections.
+func memTable(title string, ctx *Context, extra ...MemItem) uint64 {
+	items := append(ctx.MemBreakdown(), extra...)
+	live := utils.LiveHeap()
+	share := func(b uint64) string { return fmt.Sprintf("%5.1f%%", 100*float64(b)/float64(live)) }
+
+	fmt.Printf("---------------- memory %s ----------------\n", title)
+	var listed uint64
+	for _, it := range items {
+		listed += uint64(it.Bytes)
+		fmt.Printf("  %-26s %5d  %12s  %s\n", it.Name, it.Count, utils.Bytes(uint64(it.Bytes)), share(uint64(it.Bytes)))
+	}
+	gap := "  (listed > live)"
+	if live >= listed {
+		gap = share(live - listed)
+	}
+	fmt.Printf("  %-26s %5s  %12s  %s\n", "not listed (buffers...)", "", utils.BytesDelta(live, listed), gap)
+	fmt.Printf("  %-26s %5s  %12s\n", "live heap", "", utils.Bytes(live))
+	fmt.Printf("  %s | %s\n", utils.GCSettings(), utils.Mem())
+	return live
+}
+
+// memLine is one line of memory state, cheap enough for a timed section: it does not collect.
+func memLine(label string) {
+	fmt.Printf("  [mem] %-12s %s\n", label, utils.Mem())
 }
 
 // cmp16 counts how many bytes differ between got and want and returns the first differing index.
