@@ -29,7 +29,7 @@ import (
 //	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -seed 42 -csv runs/aes.csv
 //	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -seed 42 -cleanextract -csv runs/aes.csv
 
-var csvFlag = flag.String("csv", "", "append one row per operation of TestAES to this file: parameters, timing, and the precision pooled over all 64 ciphertexts")
+var csvFlag = flag.String("csv", "", "append to this file: parameters, timing, and the precision pooled over all 64 ciphertexts. TestAES writes one row per operation, TestAESBench a single row per run; the two carry different columns, so give them different files")
 
 // csvRunHeader is what every row repeats: the run, and everything that defines what it ran on.
 // csvRowHeader is what each operation adds. Splitting them lets newAESCSV check the widths match
@@ -66,27 +66,47 @@ var csvHeader = append(append([]string{}, csvRunHeader...), csvRowHeader...)
 // leaves nothing half-written to misread later.
 type aesCSV struct {
 	path    string
+	header  []string // the columns this file carries, run + row
 	run     []string // the parameter columns, identical on every row
 	rows    [][]string
 	seq     int
 	elapsed time.Duration // the operations so far, which is NOT the wall clock: see add
 }
 
-// newAESCSV also checks, before anything is computed, that the file can be appended to: finding out
-// at the END of a ten-minute run that its header belongs to an older set of columns would be a poor
-// way to learn it.
+// newAESCSV builds the per-operation recorder of TestAES.
 func newAESCSV(path string, ctx *Context, cfg Config, logN, k, blocks, rounds int, seed int64) (*aesCSV, error) {
 	if path == "" {
 		return nil, nil
 	}
-	if dir := filepath.Dir(path); dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("csv: %w", err)
-		}
-	}
-	if _, err := csvIsFresh(path); err != nil {
+	if err := csvPrepare(path, csvHeader); err != nil {
 		return nil, err
 	}
+	run, err := csvRunValues(ctx, cfg, logN, k, blocks, rounds, seed)
+	if err != nil {
+		return nil, err
+	}
+	return &aesCSV{path: path, header: csvHeader, run: run}, nil
+}
+
+// csvPrepare checks, before anything is computed, that the file can be appended to: finding out at
+// the END of a ten-minute run that its header belongs to an older set of columns would be a poor
+// way to learn it. An empty path is "no csv" and passes.
+func csvPrepare(path string, header []string) error {
+	if path == "" {
+		return nil
+	}
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("csv: %w", err)
+		}
+	}
+	_, err := csvIsFresh(path, header)
+	return err
+}
+
+// csvRunValues is what every row of a run repeats: the run itself, and everything that defines what
+// it ran on. It needs the context, so it can only be built once the keys are generated.
+func csvRunValues(ctx *Context, cfg Config, logN, k, blocks, rounds int, seed int64) ([]string, error) {
 	p, btp := ctx.Params, ctx.Eval.Parameters
 	Q, P := p.Q(), p.P()
 	mod1P := btp.Mod1ParametersLiteral
@@ -118,7 +138,7 @@ func newAESCSV(path string, ctx *Context, cfg Config, logN, k, blocks, rounds in
 	if len(run) != len(csvRunHeader) {
 		return nil, fmt.Errorf("csv: %d run values for %d run columns", len(run), len(csvRunHeader))
 	}
-	return &aesCSV{path: path, run: run}, nil
+	return run, nil
 }
 
 // add records one operation. prec.WorstBit is a distance, so prec_min is its -log2: the MINIMUM
@@ -154,12 +174,12 @@ func (c *aesCSV) write() error {
 	}
 
 	for i, r := range c.rows {
-		if len(r) != len(csvHeader) {
-			return fmt.Errorf("csv: row %d has %d fields for %d columns", i, len(r), len(csvHeader))
+		if len(r) != len(c.header) {
+			return fmt.Errorf("csv: row %d has %d fields for %d columns", i, len(r), len(c.header))
 		}
 	}
 
-	fresh, err := csvIsFresh(c.path)
+	fresh, err := csvIsFresh(c.path, c.header)
 	if err != nil {
 		return err
 	}
@@ -172,7 +192,7 @@ func (c *aesCSV) write() error {
 
 	w := csv.NewWriter(f)
 	if fresh {
-		if err := w.Write(csvHeader); err != nil {
+		if err := w.Write(c.header); err != nil {
 			return fmt.Errorf("csv header: %w", err)
 		}
 	}
@@ -194,7 +214,7 @@ func (c *aesCSV) write() error {
 
 // csvIsFresh reports whether the file needs a header, and refuses one whose header is a different
 // set of columns.
-func csvIsFresh(path string) (bool, error) {
+func csvIsFresh(path string, header []string) (bool, error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return true, nil
@@ -211,9 +231,9 @@ func csvIsFresh(path string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("csv: reading the header of %s: %w", path, err)
 	}
-	if !slices.Equal(head, csvHeader) {
+	if !slices.Equal(head, header) {
 		return false, fmt.Errorf("csv: %s has %d columns starting %q, this run writes %d starting %q; append would corrupt it",
-			path, len(head), strings.Join(head[:min(3, len(head))], ","), len(csvHeader), strings.Join(csvHeader[:3], ","))
+			path, len(head), strings.Join(head[:min(3, len(head))], ","), len(header), strings.Join(header[:3], ","))
 	}
 	return false, nil
 }

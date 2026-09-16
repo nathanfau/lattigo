@@ -47,6 +47,10 @@ type Context struct {
 
 	Cfg Config // the variants this context runs on
 
+	// Quiet silences the progress lines the pipeline prints, so a timed run measures the circuit
+	// alone. The zero value keeps them.
+	Quiet bool
+
 	// Levels that move with the cleaning depth, i.e. with the length of the chain, and with the
 	// SlotsToCoeffs block: every prime it spends beyond the first lifts the pipeline by a level.
 	SubBytesLv int // state level entering a round
@@ -210,6 +214,13 @@ func NewContextWith2(logN, k int, cfg Config, sh params2.Shape) (*Context, error
 	return c, nil
 }
 
+// logf prints a progress line unless the context is Quiet.
+func (c *Context) logf(format string, a ...any) {
+	if !c.Quiet {
+		fmt.Printf(format, a...)
+	}
+}
+
 // FirstRound is AES round 0: it XORs rk0 into the AES blocks. The blocks arrive in the CLEAR,
 // so the 'server' encodes them itself and the XOR is ciphertext against plaintext.
 // rk0 must be at InitLevel.
@@ -241,7 +252,7 @@ func (c *Context) SubBytes(st blockpack.Packed, version int) (blockpack.Packed, 
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("SubBytes group %d (v%d): %w", g, version, err)
 		}
-		fmt.Printf("[SubBytes v%d] group %2d/8 done (%s)\n", version, g+1, time.Since(t0).Round(time.Millisecond))
+		c.logf("[SubBytes v%d] group %2d/8 done (%s)\n", version, g+1, time.Since(t0).Round(time.Millisecond))
 		out[g] = ob
 	}
 	return out, nil
@@ -284,7 +295,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			return blockpack.Packed{}, fmt.Errorf("refresh Extract packet %d: %w", p, err)
 		}
 		reals[p], imags[p] = rr, ii
-		fmt.Printf("[refresh] extract packet %2d/16 done (%s)\n", p+1, time.Since(tPkt).Round(time.Millisecond))
+		c.logf("[refresh] extract packet %2d/16 done (%s)\n", p+1, time.Since(tPkt).Round(time.Millisecond))
 	}
 
 	// 4. ShiftRows at the pause: pure pointer moves on the 32 packed nibbles.
@@ -332,7 +343,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			ci.Scale = c.Canon
 			out[j][beta] = ci
 		}
-		fmt.Printf("[refresh] recombine group %2d/8 done\n", j+1)
+		c.logf("[refresh] recombine group %2d/8 done\n", j+1)
 	}
 	return out, nil
 }
@@ -402,7 +413,7 @@ func (c *Context) XorClean(st, rk blockpack.Packed) (blockpack.Packed, error) {
 // still gets a trace between the XOR and the polynomial, the other two as one fused XorClean.
 func (c *Context) arkThenClean(st, rk blockpack.Packed, after RoundStep) (blockpack.Packed, error) {
 	if c.Cfg.Place != cleaning.CleanAfter {
-		fmt.Println("---- XorClean ----")
+		c.logf("---- XorClean ----\n")
 		t0 := time.Now()
 		out, err := c.XorClean(st, rk)
 		if err != nil {
@@ -412,7 +423,7 @@ func (c *Context) arkThenClean(st, rk blockpack.Packed, after RoundStep) (blockp
 		return out, nil
 	}
 
-	fmt.Println("---- AddRoundKey ----")
+	c.logf("---- AddRoundKey ----\n")
 	t0 := time.Now()
 	st, err := c.AddRoundKey(st, rk)
 	if err != nil {
@@ -420,7 +431,7 @@ func (c *Context) arkThenClean(st, rk blockpack.Packed, after RoundStep) (blockp
 	}
 	after("AddRoundKey", time.Since(t0), st)
 
-	fmt.Println("---- Cleaning ----")
+	c.logf("---- Cleaning ----\n")
 	t0 = time.Now()
 	if st, err = c.Clean(st); err != nil {
 		return blockpack.Packed{}, fmt.Errorf("Cleaning: %w", err)
@@ -441,21 +452,21 @@ func (c *Context) Round(st, rk blockpack.Packed, version int, after RoundStep) (
 	}
 	var err error
 
-	fmt.Println("---- SubBytes ----")
+	c.logf("---- SubBytes ----\n")
 	t0 := time.Now()
 	if st, err = c.SubBytes(st, version); err != nil {
 		return blockpack.Packed{}, fmt.Errorf("Round SubBytes: %w", err)
 	}
 	after("SubBytes", time.Since(t0), st)
 
-	fmt.Println("---- Refresh ----")
+	c.logf("---- Refresh ----\n")
 	t0 = time.Now()
 	if st, err = c.Refresh(st); err != nil {
 		return blockpack.Packed{}, fmt.Errorf("Round Refresh: %w", err)
 	}
 	after("Refresh", time.Since(t0), st)
 
-	fmt.Println("---- MixColumns ----")
+	c.logf("---- MixColumns ----\n")
 	t0 = time.Now()
 	if st, err = c.AE.MixColumnsWith(c.AE.Of(c.Cfg.Xor), st); err != nil {
 		return blockpack.Packed{}, fmt.Errorf("Round MixColumns: %w", err)
@@ -478,14 +489,14 @@ func (c *Context) LastRoundV1(st, rk blockpack.Packed, version int, after RoundS
 	}
 	var err error
 
-	fmt.Println("---- SubBytes ----")
+	c.logf("---- SubBytes ----\n")
 	t0 := time.Now()
 	if st, err = c.SubBytes(st, version); err != nil {
 		return blockpack.Packed{}, fmt.Errorf("LastRoundV1 SubBytes: %w", err)
 	}
 	after("SubBytes", time.Since(t0), st)
 
-	fmt.Println("---- Refresh ----")
+	c.logf("---- Refresh ----\n")
 	t0 = time.Now()
 	if st, err = c.Refresh(st); err != nil {
 		return blockpack.Packed{}, fmt.Errorf("LastRoundV1 Refresh: %w", err)

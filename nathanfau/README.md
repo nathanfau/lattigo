@@ -1,10 +1,6 @@
 # TODO 
 
-LastRoundV2
-EvalMod in 7lvl (using the cosine's parity)
 FreeXor (for less than 2^15 aes blocks, new packing, new BTS...)
-rounds without oracle call
-logN 16
 
 # Lattigo Fork
 

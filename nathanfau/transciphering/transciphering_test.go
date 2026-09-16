@@ -76,7 +76,7 @@ func tail(cfg Config) []string {
 // with a slot / chain / precision trace and a row-major AES-oracle comparison after EVERY
 // operation. The packed layout is invariant, so rounds > 1 chain with no return trip.
 func TestTransciphering(t *testing.T) {
-	const logN, k = 11, 4
+	const logN, k = 12, 4
 
 	n := *nRoundsFlag
 	if n < 1 {
@@ -185,7 +185,7 @@ func TestTransciphering(t *testing.T) {
 // TestAES runs the whole cipher on a full batch of DISTINCT random blocks:
 // FirstRound -> 9 * Round -> LastRoundV1, with the oracle checked after EVERY operation.
 func TestAES(t *testing.T) {
-	const logN, k = 12, 4
+	const logN, k = 11, 4
 
 	if testing.Short() {
 		t.Skip("full AES: 10 rounds, several minutes")
@@ -361,6 +361,50 @@ type precSummary struct {
 	BitErr   float64 // worst distance to a clean bit, from blockpack.Decrypt
 }
 
+// measure is what a row records, and nothing else: the precision pooled over the 64 ciphertexts and
+// the oracle verdict, with no printing, so a timed run can call it once the chrono has stopped. It
+// also hands back the decrypted blocks, so a caller can name the first one that went wrong without
+// decrypting a second time.
+func measure(ctx *Context, st blockpack.Packed, want [][16]byte) (precSummary, [][16]byte, error) {
+	ciP := ctx.Sw.CiP
+	sum := precSummary{Level: st[0][0].Level()}
+
+	stats := make([]utils.BitStats, 0, 64)
+	for g := 0; g < 8; g++ {
+		for b := 0; b < 8; b++ {
+			s, err := utils.BitDistanceCt(ctx.EcdCI, ctx.DecCI, st[g][b], blockpack.SlotVec(ciP, want, g, b), 0)
+			if err != nil {
+				return sum, nil, fmt.Errorf("prec st[%d][%d]: %w", g, b, err)
+			}
+			stats = append(stats, s)
+		}
+	}
+	agg, _ := utils.WorstOf(stats)
+	sum.AvgPrec, sum.WorstBit, sum.Slots = agg.AvgPrec, agg.Worst, agg.Slots
+
+	got, bitErr, err := blockpack.Decrypt(ciP, ctx.EcdCI, ctx.DecCI, st)
+	if err != nil {
+		return sum, nil, fmt.Errorf("decrypt: %w", err)
+	}
+	sum.BitErr = bitErr
+	for bi := range want {
+		if got[bi] != want[bi] {
+			sum.Wrong++
+		}
+	}
+	return sum, got, nil
+}
+
+// firstDiff is the index of the first block the oracle disagrees with, -1 when there is none.
+func firstDiff(got, want [][16]byte) int {
+	for bi := range want {
+		if got[bi] != want[bi] {
+			return bi
+		}
+	}
+	return -1
+}
+
 func report(ctx *Context, st blockpack.Packed, states [][16]byte, round int, step string) precSummary {
 	ciP := ctx.Sw.CiP
 	debug.DbgSlotCI(fmt.Sprintf("T%d %-11s st[0][0] =", round, step), st[0][0])
@@ -379,42 +423,19 @@ func report(ctx *Context, st blockpack.Packed, states [][16]byte, round int, ste
 	debug.PrecPoolCI(fmt.Sprintf("T%d %-11s prec (128 bits) :", round, step), entries...)
 
 	// The same pool again, kept this time: one avg and one worst over ALL 64 ciphertexts and all
-	// their slots, not per byte.
-	sum := precSummary{Level: st[0][0].Level()}
-	stats := make([]utils.BitStats, 0, len(entries))
-	for _, e := range entries {
-		st, err := utils.BitDistanceCt(ctx.EcdCI, ctx.DecCI, e.Ct, e.Want, 0)
-		if err != nil {
-			fmt.Printf("  [T%d] %-11s prec: %v\n", round, step, err)
-			return sum
-		}
-		stats = append(stats, st)
-	}
-	agg, _ := utils.WorstOf(stats)
-	sum.AvgPrec, sum.WorstBit, sum.Slots = agg.AvgPrec, agg.Worst, agg.Slots
-
-	got, bitErr, err := blockpack.Decrypt(ciP, ctx.EcdCI, ctx.DecCI, st)
+	// their slots, not per byte, plus the batch against the oracle.
+	sum, got, err := measure(ctx, st, states)
 	if err != nil {
-		fmt.Printf("  [T%d] %-11s ORACLE: decrypt error: %v\n", round, step, err)
+		fmt.Printf("  [T%d] %-11s %v\n", round, step, err)
 		return sum
 	}
-	sum.BitErr = bitErr
-	wrong, firstBad := 0, -1
-	for bi := range states {
-		if got[bi] != states[bi] {
-			wrong++
-			if firstBad < 0 {
-				firstBad = bi
-			}
-		}
-	}
-	sum.Wrong = wrong
-	if wrong == 0 {
-		fmt.Printf("  [T%d] %-11s ORACLE: TRUE all %d blocks (worst bit err %.4f)\n", round, step, len(states), bitErr)
+	if sum.Wrong == 0 {
+		fmt.Printf("  [T%d] %-11s ORACLE: TRUE all %d blocks (worst bit err %.4f)\n", round, step, len(states), sum.BitErr)
 		return sum
 	}
+	firstBad := firstDiff(got, states)
 	w, f := cmp16(got[firstBad], states[firstBad])
 	fmt.Printf("  [T%d] %-11s ORACLE: FALSE %d/%d blocks wrong (worst bit err %.4f; first bad block %d: %d/16 bytes, first byte %d)\n            got =%x\n            want=%x\n",
-		round, step, wrong, len(states), bitErr, firstBad, w, f, got[firstBad], states[firstBad])
+		round, step, sum.Wrong, len(states), sum.BitErr, firstBad, w, f, got[firstBad], states[firstBad])
 	return sum
 }
