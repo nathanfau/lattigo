@@ -2,6 +2,7 @@ package transciphering
 
 //	go test ./nathanfau/transciphering/ -run '^TestAESBench$' -v -subbytes 2 -timeout 0
 //	go test ./nathanfau/transciphering/ -run '^TestAESBench$' -v -timeout 0 -seed 42 -csv runs/aesbench.csv
+//	go test ./nathanfau/transciphering/ -run '^TestAESBench$' -v -timeout 0 -logn 16 -stc 2x30 -logqi 38 -cleanextract
 //
 // The -csv file gets ONE row per run, appended, so a file accumulates runs. Its columns are not
 // those TestAES writes: give the two tests different files.
@@ -14,6 +15,7 @@ import (
 
 	"github.com/tuneinsight/lattigo/v6/nathanfau/aes"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/blockpack"
+	"github.com/tuneinsight/lattigo/v6/nathanfau/debug"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/params2"
 	"github.com/tuneinsight/lattigo/v6/nathanfau/utils"
 )
@@ -36,7 +38,8 @@ var csvBenchHeader = append(append([]string{}, csvRunHeader...), csvBenchRowHead
 // (FHE keys and the encrypted key schedule) and the transciphering itself (FirstRound -> 9 * Round
 // -> LastRoundV1); the oracle runs once, after both have stopped.
 func TestAESBench(t *testing.T) {
-	const logN, k = 11, 4
+	const k = 4
+	logN := *logNFlag
 
 	if testing.Short() {
 		t.Skip("full AES: 10 rounds, several minutes")
@@ -54,8 +57,19 @@ func TestAESBench(t *testing.T) {
 	rk := aes.KeyExpansion(key[:])
 	last := len(rk) - 1 // round 0 is the initial ARK, the last one has no MixColumns
 
-	fmt.Printf(" AES-128 bench: SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, STC=%s, logN=%d, random seed = %d \n",
-		*sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), params2.FormatLogSTC(sh.LogSTC), logN, seed)
+	fmt.Printf(" AES-128 bench: SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, %s, random seed = %d \n",
+		*sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), chainName(sh), seed)
+
+	// The parameters are built once more here, outside the chronos, to print the chain before the
+	// long part: a chain that cannot be built fails now rather than inside the KeyGen.
+	params, _, err := params2.TranscipheringParamsWith(logN, k, cfg.Clean.Depth(), cfg.ExtractLevels(k), sh)
+	if err != nil {
+		t.Fatalf("parameters: %v", err)
+	}
+	debug.DbgParams("TranscipheringParams", params)
+	digit := widestDigit(params.Q(), params.PCount())
+	fmt.Printf("  key-switching   : dnum %d, widest digit %.1f bits under P %.1f bits, margin %+.1f\n",
+		params.BaseRNSDecompositionVectorSize(params.MaxLevelQ(), params.MaxLevelP()), digit, params.LogP(), params.LogP()-digit)
 
 	// KeyGen: everything done once per key, i.e. the FHE keys and the key schedule encrypted at the
 	// three levels the pipeline takes it at.

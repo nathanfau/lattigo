@@ -2,7 +2,7 @@ package transciphering
 
 //	go test ./nathanfau/transciphering/ -run '^TestTransciphering$' -v -subbytes 2 -rounds 1 -timeout 0
 //	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -subbytes 2 -timeout 0
-//	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -subbytes 2 -timeout 0 -stc 60
+//	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -subbytes 2 -timeout 0 -logn 12 -stc 60 -logqi 40
 
 import (
 	"flag"
@@ -29,6 +29,8 @@ var (
 	xtractFlag  = flag.Bool("cleanextract", false, "run the refresh on BitExtractClean (interpolation and cleaning fused, error quadratic in Algo1's output) instead of BitExtract (half spectrum, error linear); costs one prime more")
 	seedFlag    = flag.Int64("seed", 0, "seed of the block draw; 0 draws one from the clock")
 	stcFlag     = flag.String("stc", "2x30", `SlotsToCoeffs primes, one level each: "2x30" or "30,30"; "60" is the chain's historical single prime (one level, dense matrix, far too heavy at large logN)`)
+	logNFlag    = flag.Int("logn", 11, "ring degree of the pipeline")
+	logQiFlag   = flag.Int("logqi", params2.LogScale, "size in bits of the chain's primes, every Q prime but q0 and the SlotsToCoeffs ones, which is also the scale the pipeline runs at; q0 follows it, P and -stc do not")
 )
 
 // blockSeed fixes WHICH blocks the batch carries, so two configs can be compared on the same
@@ -59,15 +61,23 @@ func config(t *testing.T) Config {
 	return Config{Xor: xk, Clean: ck, Place: pk, CleanExtract: *xtractFlag}
 }
 
-// shape parses -stc, also before any keygen. Every level the tests use is read off the context,
-// which follows the extra levels a longer SlotsToCoeffs adds.
+// shape parses -stc and -logqi, also before any keygen. Every level the tests use is read off the
+// context, which follows the extra levels a longer SlotsToCoeffs adds.
 func shape(t *testing.T) params2.Shape {
 	t.Helper()
 	logSTC, err := params2.ParseLogSTC(*stcFlag)
 	if err != nil {
 		t.Fatalf("-stc: %v", err)
 	}
-	return params2.Shape{LogSTC: logSTC}
+	if *logQiFlag < 1 {
+		t.Fatalf("-logqi %d: want a prime size in bits", *logQiFlag)
+	}
+	return params2.Shape{LogSTC: logSTC, LogQi: *logQiFlag}
+}
+
+// chainName is what the headers print of the chain the flags selected.
+func chainName(sh params2.Shape) string {
+	return fmt.Sprintf("logN=%d, q_i=%d, STC=%s", *logNFlag, sh.LogQi, params2.FormatLogSTC(sh.LogSTC))
 }
 
 // extractName is what the trace calls the extraction the config selected.
@@ -90,15 +100,16 @@ func tail(cfg Config) []string {
 // with a slot / chain / precision trace and a row-major AES-oracle comparison after EVERY
 // operation. The packed layout is invariant, so rounds > 1 chain with no return trip.
 func TestTransciphering(t *testing.T) {
-	const logN, k = 12, 4
+	const k = 4
+	logN := *logNFlag
 
 	n := *nRoundsFlag
 	if n < 1 {
 		n = 1
 	}
 	cfg, sh := config(t), shape(t)
-	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, STC=%s \n",
-		n, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), params2.FormatLogSTC(sh.LogSTC))
+	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, %s \n",
+		n, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), chainName(sh))
 
 	ctx, err := NewContextWith2(logN, k, cfg, sh)
 	if err != nil {
@@ -202,7 +213,8 @@ func TestTransciphering(t *testing.T) {
 // TestAES runs the whole cipher on a full batch of DISTINCT random blocks:
 // FirstRound -> 9 * Round -> LastRoundV1, with the oracle checked after EVERY operation.
 func TestAES(t *testing.T) {
-	const logN, k = 11, 4
+	const k = 4
+	logN := *logNFlag
 
 	if testing.Short() {
 		t.Skip("full AES: 10 rounds, several minutes")
@@ -223,8 +235,8 @@ func TestAES(t *testing.T) {
 
 	seed := blockSeed()
 	blocks := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
-	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, STC=%s, %d blocks, random seed = %d \n",
-		nMiddle, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), params2.FormatLogSTC(sh.LogSTC), len(blocks), seed)
+	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, %s, %d blocks, random seed = %d \n",
+		nMiddle, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), chainName(sh), len(blocks), seed)
 
 	rec, err := newAESCSV(*csvFlag, ctx, cfg, logN, k, len(blocks), nMiddle, seed)
 	if err != nil {

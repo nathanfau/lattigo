@@ -335,6 +335,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 	ck := eval.Evaluator
 
 	// 1-2. BitPack the 4-bit nibbles in CI, then convert to Std
+	t0 := time.Now()
 	var packed [16]*rlwe.Ciphertext
 	for g := 0; g < 8; g++ {
 		lo, err := bitbatching.BitPack(c.Sw.EvalCI, st[g][0:4])
@@ -353,6 +354,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			packed[2*g+i] = s
 		}
 	}
+	c.logf("[Algo1] BitPack + CI->Std, 16 packets done (%s)\n", time.Since(t0).Round(time.Millisecond))
 
 	// 3. algo1.Extract per packet (drop to the Algo1 input level first).
 	var reals, imags [16]*rlwe.Ciphertext
@@ -366,7 +368,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			return blockpack.Packed{}, fmt.Errorf("refresh Extract packet %d: %w", p, err)
 		}
 		reals[p], imags[p] = rr, ii
-		c.logf("[refresh] extract packet %2d/16 done (%s)\n", p+1, time.Since(tPkt).Round(time.Millisecond))
+		c.logf("[Algo1] packet %2d/16: STC + ModUp + CTS + cos/sin + Re/Im split done (%s)\n", p+1, time.Since(tPkt).Round(time.Millisecond))
 	}
 
 	// 4. ShiftRows at the pause: pure pointer moves on the 32 packed nibbles.
@@ -374,16 +376,20 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 
 	// 5. algo1.Resume: the double-angle squarings, on all 32 nibbles (square is pointwise, commutes
 	//    with the ShiftRows permutation).
+	t0 = time.Now()
 	for k := 0; k < 16; k++ {
 		if err := algo1.Resume(eval, re[k], im[k]); err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh Resume %d: %w", k, err)
 		}
 	}
+	c.logf("[Algo1] ShiftRows + squarings, 32 nibbles done (%s)\n", time.Since(t0).Round(time.Millisecond))
 
-	// 6. Extract each nibble, CombineReIm (real byte + i*imag byte), Std -> CI, canonical scale.
+	// 6. Per output group, the bit extraction of its 4 nibbles (its two bytes), then CombineReIm (real
+	//    byte + i*imag byte), Std -> CI and the canonical scale on its 8 bits.
 	extract := c.Cfg.Extract()
 	var out blockpack.Packed
 	for j := 0; j < 8; j++ {
+		tExt := time.Now()
 		aLo, err := extract(c.Params, ck, re[2*j], c.K)
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh extract re low j=%d: %w", j, err)
@@ -400,8 +406,10 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh extract im high j=%d: %w", j, err)
 		}
+		dExt := time.Since(tExt)
 		aBits := append(append([]*rlwe.Ciphertext{}, aLo...), aHi...) // 8 bits of the real byte
 		bBits := append(append([]*rlwe.Ciphertext{}, bLo...), bHi...) // 8 bits of the imag byte
+		tConv := time.Now()
 		for beta := 0; beta < 8; beta++ {
 			z, err := utils.CombineReIm(ck, aBits[beta], bBits[beta])
 			if err != nil {
@@ -414,7 +422,8 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			ci.Scale = c.Canon
 			out[j][beta] = ci
 		}
-		c.logf("[refresh] recombine group %2d/8 done\n", j+1)
+		c.logf("[Algo1] group %d/8: bit extraction, 4 nibbles (%s) + Re/Im recombination and Std->CI, 8 bits (%s)\n",
+			j+1, dExt.Round(time.Millisecond), time.Since(tConv).Round(time.Millisecond))
 	}
 	return out, nil
 }

@@ -21,7 +21,9 @@ donc `runs/aes.csv` écrit dans `nathanfau/transciphering/runs/`. `plot.py`, lui
 cwd — d'où les chemins complets dans tout ce qui suit.
 
 Les flags qui changent la configuration : `-subbytes`, `-xor`, `-clean`, `-place`, `-cleanextract`,
-`-seed`. `logN` n'est pas un flag — c'est une constante en tête de `TestAES`, à changer dans le code.
+`-seed`, et pour la chaîne `-logn` (défaut 11), `-stc` (primes de SlotsToCoeffs, défaut `2x30`) et
+`-logqi` (taille des primes q_i de la chaîne et de l'échelle, défaut 38 ; q0 suit, P et `-stc` non).
+La chaîne se relit dans les colonnes `logn`, `logscale`, `q_sizes` et `s2c_levels`.
 
 Chaque run porte son horodatage de démarrage (`run_ts`) et **toutes** ses colonnes de configuration,
 répétées sur chaque ligne : le fichier se suffit à lui-même et deux runs se concatènent sans

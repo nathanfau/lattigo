@@ -81,8 +81,14 @@ const DefaultLogQ0 = LogScale
 type Shape struct {
 	LogP   []int // sizes of the P primes; nil = DefaultLogP
 	LogSTC []int // sizes of the SlotsToCoeffs primes, one level each; nil = DefaultLogSTC
-	LogQ0  int   // size of the bottom prime; 0 = DefaultLogQ0. The message ratio follows it:
-	// LogMessageRatio = LogQ0 - LogScale, so 42 gives 2^4 and 38 gives 1.
+	LogQ0  int   // size of the bottom prime; 0 = the chain scale plus DefaultLogQ0 - LogScale, the
+	// default message ratio. The ratio follows it: LogMessageRatio = LogQ0 - LogQi, so with 38-bit
+	// primes 42 gives 2^4 and 38 gives 1.
+
+	// LogQi is the size of the chain's primes, every Q prime but q0 and the SlotsToCoeffs ones, and
+	// the scale the pipeline runs at: 0 = LogScale. Neither P nor the SlotsToCoeffs primes follow
+	// it, so moving it moves the widest key-switching digit against a fixed P.
+	LogQi int
 }
 
 // ParseLogSTC reads a SlotsToCoeffs shape the way the test flags write it: the prime sizes, "30,30",
@@ -125,18 +131,24 @@ func FormatLogSTC(logSTC []int) string {
 // polynomial's depth and extractLv the bit extraction's, k or k+1; both lengthen the chain above
 // the circuit, where a longer SlotsToCoeffs lengthens it below and shifts every level up.
 func TranscipheringParamsWith(logN, k, cleanDepth, extractLv int, sh Shape) (ckks.Parameters, bootstrapping.Parameters, error) {
-	logP, logSTC, logQ0 := sh.LogP, sh.LogSTC, sh.LogQ0
+	logP, logSTC, logQ0, logQi := sh.LogP, sh.LogSTC, sh.LogQ0, sh.LogQi
 	if logP == nil {
 		logP = DefaultLogP()
 	}
 	if logSTC == nil {
 		logSTC = DefaultLogSTC()
 	}
-	if logQ0 == 0 {
-		logQ0 = DefaultLogQ0
+	if logQi == 0 {
+		logQi = LogScale
 	}
-	if logQ0 < LogScale || logQ0 > LogScale+k {
-		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("logQ0 %d, want between LogScale %d (message ratio 1) and LogScale+k %d (ratio 2^k)", logQ0, LogScale, LogScale+k)
+	if logQi < 1 {
+		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("logQi %d, want a prime size in bits", logQi)
+	}
+	if logQ0 == 0 {
+		logQ0 = logQi + DefaultLogQ0 - LogScale
+	}
+	if logQ0 < logQi || logQ0 > logQi+k {
+		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("logQ0 %d, want between the chain scale %d (message ratio 1) and %d (ratio 2^k)", logQ0, logQi, logQi+k)
 	}
 	if len(logSTC) == 0 {
 		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("logSTC is empty: SlotsToCoeffs spends at least one prime")
@@ -151,27 +163,25 @@ func TranscipheringParamsWith(logN, k, cleanDepth, extractLv int, sh Shape) (ckk
 		return ckks.Parameters{}, bootstrapping.Parameters{}, fmt.Errorf("extractLv %d, want %d or %d", extractLv, k, k+1)
 	}
 	logQ := []int{logQ0}
-	logQ = append(logQ, logSTC...)  // SlotsToCoeffs, one level per prime
-	logQ = append(logQ, 38)         // Conv_{Real->Cplx}
-	logQ = append(logQ, 38, 38, 38) // SubBytes
-	for i := 0; i < cleanDepth; i++ {
-		logQ = append(logQ, 38) // cleaning
-	}
-	logQ = append(logQ, 38)         // AddRoundKey
-	logQ = append(logQ, 38, 38, 38) // MixColumns
+	// qi repeats the chain prime n times.
+	qi := func(n int) []int { return slices.Repeat([]int{logQi}, n) }
+	logQ = append(logQ, logSTC...)         // SlotsToCoeffs, one level per prime
+	logQ = append(logQ, qi(1)...)          // Conv_{Real->Cplx}
+	logQ = append(logQ, qi(3)...)          // SubBytes
+	logQ = append(logQ, qi(cleanDepth)...) // cleaning
+	logQ = append(logQ, qi(1)...)          // AddRoundKey
+	logQ = append(logQ, qi(3)...)          // MixColumns
 	// refresh
-	logQ = append(logQ, 38) // Conv_{Cplx->Real}
-	for i := 0; i < extractLv; i++ {
-		logQ = append(logQ, 38) // bit extraction
-	}
-	logQ = append(logQ, 38, 38, 38)         // 3 levels for squaring
-	logQ = append(logQ, 38)                 // extractExp
-	logQ = append(logQ, 38)                 // Conv_{Real->Cplx}
-	logQ = append(logQ, 38, 38, 38, 38, 38) // EvalCos
-	logQ = append(logQ, 38)                 // Conv_{Cplx->Real}
-	logQ = append(logQ, 38, 38, 38)         // CoeffsToSlots
+	logQ = append(logQ, qi(1)...)         // Conv_{Cplx->Real}
+	logQ = append(logQ, qi(extractLv)...) // bit extraction
+	logQ = append(logQ, qi(3)...)         // 3 levels for squaring
+	logQ = append(logQ, qi(1)...)         // extractExp
+	logQ = append(logQ, qi(1)...)         // Conv_{Real->Cplx}
+	logQ = append(logQ, qi(5)...)         // EvalCos
+	logQ = append(logQ, qi(1)...)         // Conv_{Cplx->Real}
+	logQ = append(logQ, qi(3)...)         // CoeffsToSlots
 
-	params, err := ciThenStd(logN, logQ, logP, 38)
+	params, err := ciThenStd(logN, logQ, logP, logQi)
 	if err != nil {
 		return ckks.Parameters{}, bootstrapping.Parameters{}, err
 	}
@@ -195,11 +205,11 @@ func TranscipheringParamsWith(logN, k, cleanDepth, extractLv int, sh Shape) (ckk
 
 	Mod1Params := mod1.ParametersLiteral{
 		LevelQ:          params.MaxLevel() - C2SParams.Depth(true),
-		LogScale:        38,
+		LogScale:        logQi,
 		Mod1Type:        mod1.CosDiscrete,
 		Mod1Degree:      2 * ((1 << k) - 1),
 		K:               1 << k,
-		LogMessageRatio: logQ0 - LogScale,
+		LogMessageRatio: logQ0 - logQi,
 	}
 	mod1P, err := mod1.NewParametersFromLiteral(params, Mod1Params)
 	if err != nil {
