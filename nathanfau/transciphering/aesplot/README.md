@@ -12,12 +12,16 @@ Le flag `-csv` de `TestAES` **ajoute** au fichier : pointe tous tes runs sur le 
 s'empilent.
 
 ```sh
-go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -csv runs/aes.csv
-go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -cleanextract -csv runs/aes2.csv ; go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -cleanextract -xor sq -csv runs/aes2.csv
+go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -csv runs/2026-09-07_aes.csv
+go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -cleanextract -csv runs/2026-09-12_aes2.csv ; go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -cleanextract -xor sq -csv runs/2026-09-12_aes2.csv
 ```
 
+`runs/` est rangé par ordre chronologique : chaque fichier porte en préfixe la date `AAAA-MM-JJ_` de
+son premier run, et une figure celle du CSV qu'elle trace (celle de sa production si elle en réunit
+plusieurs). Un nouveau CSV prend la date du jour : `-csv runs/2026-09-18_aes-sbexact.csv`.
+
 `-csv` est relatif au **répertoire du package**, pas au tien : `go test` y place le binaire de test,
-donc `runs/aes.csv` écrit dans `nathanfau/transciphering/runs/`. `plot.py`, lui, résout depuis ton
+donc `runs/2026-09-07_aes.csv` écrit dans `nathanfau/transciphering/runs/`. `plot.py`, lui, résout depuis ton
 cwd — d'où les chemins complets dans tout ce qui suit.
 
 Les flags qui changent la configuration : `-subbytes`, `-xor`, `-clean`, `-place`, `-cleanextract`,
@@ -33,12 +37,12 @@ un en-tête incompatible échoue tout de suite et pas à la fin.
 ## Tracer
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv
 ```
 
 C'est tout ce qu'il faut pour le cas courant : un PNG par valeur de `logn`, écrit à côté du CSV —
-`nathanfau/transciphering/runs/aes-logn11.png`, `…-logn12.png`… Ajoute un run à logN 13 et le
-prochain appel sortira `aes-logn13.png` sans que tu touches à quoi que ce soit.
+`nathanfau/transciphering/runs/2026-09-07_aes-logn11.png`, `…-logn12.png`… Ajoute un run à logN 13 et le
+prochain appel sortira `2026-09-07_aes-logn13.png` sans que tu touches à quoi que ce soit.
 
 Le découpage par défaut est `--split logn` parce que deux degrés d'anneau ne se comparent pas sur un
 même axe : le bruit de décodage CKKS croît en `σ√N`, donc l'écart entre deux logN n'est pas une
@@ -58,23 +62,23 @@ propriété du circuit.
 ### Exemples
 
 **Un seul degré d'anneau.** Le suffixe n'est pas doublé : un `--where` qui épingle déjà la colonne
-de découpage la désactive. Sort `runs/aes-logn11.png`.
+de découpage la désactive. Sort `runs/2026-09-07_aes-logn11.png`.
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv --where logn=11
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv --where logn=11
 ```
 
 **Isoler un circuit XOR**, aux deux degrés. Les filtres se composent avec le découpage, donc deux
-PNG : `runs/aes-xorsq-logn11.png` et `…-logn12.png`.
+PNG : `runs/2026-09-07_aes-xorsq-logn11.png` et `…-logn12.png`.
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv --where xor=sq
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv --where xor=sq
 ```
 
 **Croiser deux filtres.** Répète `--where` :
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv \
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv \
     --where logn=11 --where xor=nosq
 ```
 
@@ -82,22 +86,22 @@ python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/
 pénible à citer dans un shell ; `extractlv` vaut 4 ou 5 et dit la même chose :
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv --where extractlv=5
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv --where extractlv=5
 ```
 
 **Une seule opération, tour par tour.** `--where step=...` ne garde que ces lignes : dix points par
 run au lieu de cinquante, et on lit directement ce que le refresh rend à chaque tour.
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv --where step=Refresh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv --where step=Cleaning
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv --where step=Refresh
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv --where step=Cleaning
 ```
 
 **Découper sur autre chose que `logn`.** Un PNG par extraction, ou par circuit XOR :
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv --split extract
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv --split xor
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv --split extract
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv --split xor
 ```
 
 Attention : `--split` remplace le découpage par logN, il ne s'y ajoute pas. Ces deux commandes
@@ -106,31 +110,31 @@ mélangent donc les degrés d'anneau sur un même axe — c'est justement ce que
 **Ajouter la moyenne.** Trait plein pour le pire slot, pointillés pour la moyenne, même couleur :
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv --where logn=11 --avg
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv --where logn=11 --avg
 ```
 
 **Une figure ponctuelle**, nom et titre choisis :
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv --where logn=11 \
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv --where logn=11 \
     --out /tmp/figure.png --title "Effet du cleaning fusionne" --dpi 220
 ```
 
 **Voir la dispersion entre deux passes** d'une même configuration, que le script écarte par défaut :
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv --where logn=11 --all
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv --where logn=11 --all
 ```
 
 **Tout dans un seul graphique**, si tu sais pourquoi :
 
 ```sh
-python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/aes.csv \
+python3 nathanfau/transciphering/aesplot/plot.py --csv nathanfau/transciphering/runs/2026-09-07_aes.csv \
     --split none --out /tmp/tout.png
 ```
 
 Le nom du PNG découle du CSV et des filtres, les caractères non alphanumériques retirés : `--where
-xor=sq` donne `nathanfau/transciphering/runs/aes-xorsq-logn11.png`. Les colonnes filtrables sont
+xor=sq` donne `nathanfau/transciphering/runs/2026-09-07_aes-xorsq-logn11.png`. Les colonnes filtrables sont
 toutes celles du CSV, listées plus bas.
 
 Le script imprime aussi le tableau des moyennes par opération. C'est la même information en texte,
@@ -153,7 +157,7 @@ blocs ne correspondent plus à l'AES en clair. Au-delà du premier point où ell
 courbe mesure une dérive, pas une précision :
 
 ```sh
-python3 -c "import pandas as pd; d=pd.read_csv('nathanfau/transciphering/runs/aes.csv'); print(d[d.blocks_wrong>0][['run_ts','round','step','blocks_wrong']].to_string())"
+python3 -c "import pandas as pd; d=pd.read_csv('nathanfau/transciphering/runs/2026-09-07_aes.csv'); print(d[d.blocks_wrong>0][['run_ts','round','step','blocks_wrong']].to_string())"
 ```
 
 ## Colonnes du CSV

@@ -1,6 +1,7 @@
 package transciphering
 
 //	go test ./nathanfau/transciphering/ -run '^TestTransciphering$' -v -subbytes 2 -rounds 1 -timeout 0
+//	go test ./nathanfau/transciphering/ -run '^TestTransciphering$' -v -subbytes 2 -rounds 4 -timeout 0 -csv runs/aes.csv
 //	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -subbytes 2 -timeout 0
 //	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -subbytes 2 -timeout 0 -logn 12 -stc 60 -logqi 40
 
@@ -8,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"strconv"
 
 	"testing"
 	"time"
@@ -21,17 +23,29 @@ import (
 )
 
 var (
-	nRoundsFlag = flag.Int("rounds", 1, "number of AES middle rounds to run")
-	sbVersion   = flag.Int("subbytes", 2, "SubBytes version (1..3), by decreasing cost: 247, 98, 69 relin per byte")
-	xorFlag     = flag.String("xor", "nosq", `XOR circuit used throughout: "nosq" for x+y-2xy, "sq" for (x-y)^2`)
-	cleanFlag   = flag.String("clean", "cleaning", `cleaning polynomial: "cleaning" (2 levels), "smoother" or "verysmoother" (3 levels, one prime more)`)
-	placeFlag   = flag.String("place", "after", `where the round cleaning lands: "after" (AddRoundKey then Cleaning), "both" (clean state and key, then XOR) or "one" (clean the state only, then XOR)`)
-	xtractFlag  = flag.Bool("cleanextract", false, "run the refresh on BitExtractClean (interpolation and cleaning fused, error quadratic in Algo1's output) instead of BitExtract (half spectrum, error linear); costs one prime more")
-	seedFlag    = flag.Int64("seed", 0, "seed of the block draw; 0 draws one from the clock")
-	stcFlag     = flag.String("stc", "2x30", `SlotsToCoeffs primes, one level each: "2x30" or "30,30"; "60" is the chain's historical single prime (one level, dense matrix, far too heavy at large logN)`)
-	logNFlag    = flag.Int("logn", 11, "ring degree of the pipeline")
-	logQiFlag   = flag.Int("logqi", params2.LogScale, "size in bits of the chain's primes, every Q prime but q0 and the SlotsToCoeffs ones, which is also the scale the pipeline runs at; q0 follows it, P and -stc do not")
+	nRoundsFlag  = flag.Int("rounds", 1, "number of AES middle rounds to run")
+	sbVersion    = flag.Int("subbytes", 2, "SubBytes version (1..3), by decreasing cost: 247, 98, 69 relin per byte")
+	xorFlag      = flag.String("xor", "nosq", `XOR circuit used throughout: "nosq" for x+y-2xy, "sq" for (x-y)^2`)
+	cleanFlag    = flag.String("clean", "cleaning", `cleaning polynomial: "cleaning" (2 levels), "smoother" or "verysmoother" (3 levels, one prime more)`)
+	placeFlag    = flag.String("place", "after", `where the round cleaning lands: "after" (AddRoundKey then Cleaning), "both" (clean state and key, then XOR) or "one" (clean the state only, then XOR)`)
+	xtractFlag   = flag.Bool("cleanextract", false, "run the refresh on BitExtractClean (interpolation and cleaning fused, error quadratic in Algo1's output) instead of BitExtract (half spectrum, error linear); costs one prime more")
+	seedFlag     = flag.Int64("seed", 0, "seed of the block draw; 0 draws one from the clock")
+	stcFlag      = flag.String("stc", "2x30", `SlotsToCoeffs primes, one level each: "2x30" or "30,30"; "60" is the chain's historical single prime (one level, dense matrix, far too heavy at large logN)`)
+	logNFlag     = flag.Int("logn", 11, "ring degree of the pipeline")
+	logQiFlag    = flag.Int("logqi", params2.LogScale, "size in bits of the chain's primes, every Q prime but q0 and the SlotsToCoeffs ones, which is also the scale the pipeline runs at; q0 follows it, P and -stc do not")
+	sbExactFlag  = flag.Bool("sbexact", false, "run SubBytes on the exactly aligned S-box (aes.SubByteExact); temporary. Implies -cleanfixed")
+	refreshCanon = flag.Bool("refreshcanon", false, "land the refresh's bit extraction on the canonical scale instead of relabelling its output as canonical")
+	zoneFlag     = flag.Int("zone", 0, "size of the primes of the AES circuit and the bit extraction, and of the scale there (params2.Shape.LogZone); 0 or -logqi = no zone, the pipeline as it always ran")
+	cleanFixed   = flag.Bool("cleanfixed", false, "land the round cleaning on the default scale instead of its input's, so the 8 bits of a byte leave it on one scale; -sbexact implies it")
 )
+
+// sboxName is the SubBytes variant the flags select, as the headers and the csv write it.
+func sboxName() string {
+	if *sbExactFlag {
+		return fmt.Sprintf("%dexact", *sbVersion)
+	}
+	return strconv.Itoa(*sbVersion)
+}
 
 // blockSeed fixes WHICH blocks the batch carries, so two configs can be compared on the same
 // input. It does NOT fix the key or the encryption noise, which lattigo draws from crypto/rand:
@@ -61,7 +75,7 @@ func config(t *testing.T) Config {
 	return Config{Xor: xk, Clean: ck, Place: pk, CleanExtract: *xtractFlag}
 }
 
-// shape parses -stc and -logqi, also before any keygen. Every level the tests use is read off the
+// shape parses -stc, -logqi and -zone, also before any keygen. Every level the tests use is read off the
 // context, which follows the extra levels a longer SlotsToCoeffs adds.
 func shape(t *testing.T) params2.Shape {
 	t.Helper()
@@ -72,12 +86,16 @@ func shape(t *testing.T) params2.Shape {
 	if *logQiFlag < 1 {
 		t.Fatalf("-logqi %d: want a prime size in bits", *logQiFlag)
 	}
-	return params2.Shape{LogSTC: logSTC, LogQi: *logQiFlag}
+	return params2.Shape{LogSTC: logSTC, LogQi: *logQiFlag, LogZone: *zoneFlag}
 }
 
 // chainName is what the headers print of the chain the flags selected.
 func chainName(sh params2.Shape) string {
-	return fmt.Sprintf("logN=%d, q_i=%d, STC=%s", *logNFlag, sh.LogQi, params2.FormatLogSTC(sh.LogSTC))
+	zone := "none"
+	if sh.HasZone() {
+		zone = fmt.Sprintf("%d bits", sh.LogZone)
+	}
+	return fmt.Sprintf("logN=%d, q_i=%d, STC=%s, zone=%s", *logNFlag, sh.LogQi, params2.FormatLogSTC(sh.LogSTC), zone)
 }
 
 // extractName is what the trace calls the extraction the config selected.
@@ -108,13 +126,16 @@ func TestTransciphering(t *testing.T) {
 		n = 1
 	}
 	cfg, sh := config(t), shape(t)
-	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, %s \n",
-		n, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), chainName(sh))
+	fmt.Printf(" Transciphering: rounds=%d, SubBytes=V%s, XOR=%s, clean=%s, place=%s, extract=%s, %s \n",
+		n, sboxName(), cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), chainName(sh))
 
 	ctx, err := NewContextWith2(logN, k, cfg, sh)
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
+	ctx.SBoxExact = *sbExactFlag
+	ctx.CleanFixedScale = *cleanFixed
+	ctx.RefreshCanon = *refreshCanon
 	debug.DbgParams("TranscipheringParams", ctx.Params)
 	ciP := ctx.Sw.CiP
 
@@ -126,11 +147,16 @@ func TestTransciphering(t *testing.T) {
 	seed := blockSeed()
 	states := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
 	fmt.Printf("random seed = %d  (%d blocks)\n", seed, len(states))
+
+	rec, err := newAESCSV(*csvFlag, ctx, cfg, logN, k, len(states), n, seed)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
 	for bi := range states {
 		aes.AddRoundKey(states[bi][:], rk[0])
 	}
 
-	st, err := blockpack.Encrypt(ciP, ctx.EcdCI, ctx.EncCI, states, ctx.SubBytesLv)
+	st, err := blockpack.EncryptAt(ciP, ctx.EcdCI, ctx.EncCI, states, ctx.SubBytesLv, ctx.Canon)
 	if err != nil {
 		t.Fatalf("blockpack.Encrypt state: %v", err)
 	}
@@ -142,7 +168,7 @@ func TestTransciphering(t *testing.T) {
 	memTable("before the rounds", ctx, packedItem("round keys", rkHE...), packedItem("state", st))
 
 	fmt.Println("================ input (entry to round 1) ================")
-	report(ctx, st, states, 0, "input")
+	rec.add(0, "input", 0, report(ctx, st, states, 0, "input"))
 
 	times := map[string][]time.Duration{}
 	tGlobal := time.Now()
@@ -169,7 +195,7 @@ func TestTransciphering(t *testing.T) {
 					aes.AddRoundKey(states[bi][:], rk[r])
 				}
 			}
-			report(ctx, st, states, r, name)
+			rec.add(r, name, dur, report(ctx, st, states, r, name))
 		}
 
 		if st, err = ctx.Round(st, rkHE[r], *sbVersion, after); err != nil {
@@ -208,6 +234,10 @@ func TestTransciphering(t *testing.T) {
 	} else {
 		fmt.Printf("\n=== OK: %d middle round(s), all %d blocks conform to the row-major AES oracle ===\n", n, len(states))
 	}
+
+	if err := rec.write(); err != nil {
+		t.Errorf("%v", err)
+	}
 }
 
 // TestAES runs the whole cipher on a full batch of DISTINCT random blocks:
@@ -226,6 +256,9 @@ func TestAES(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
+	ctx.SBoxExact = *sbExactFlag
+	ctx.CleanFixedScale = *cleanFixed
+	ctx.RefreshCanon = *refreshCanon
 	debug.DbgParams("TranscipheringParams", ctx.Params)
 	ciP := ctx.Sw.CiP
 
@@ -235,8 +268,8 @@ func TestAES(t *testing.T) {
 
 	seed := blockSeed()
 	blocks := blockpack.RandomBlocks(ciP, rand.New(rand.NewSource(seed)))
-	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, %s, %d blocks, random seed = %d \n",
-		nMiddle, *sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), chainName(sh), len(blocks), seed)
+	fmt.Printf(" AES-128: %d middle rounds, SubBytes=V%s, XOR=%s, clean=%s, place=%s, extract=%s, %s, %d blocks, random seed = %d \n",
+		nMiddle, sboxName(), cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), chainName(sh), len(blocks), seed)
 
 	rec, err := newAESCSV(*csvFlag, ctx, cfg, logN, k, len(blocks), nMiddle, seed)
 	if err != nil {
@@ -355,14 +388,14 @@ func TestAES(t *testing.T) {
 }
 
 // encRK packs a round key at the given level: the key stream is shared, so the 16 bytes are
-// replicated over the whole batch and packed exactly like a state.
+// replicated over the whole batch and packed exactly like a state, at the state's scale.
 func encRK(t *testing.T, ctx *Context, rk []byte, blocks, level int) blockpack.Packed {
 	t.Helper()
 	repl := make([][16]byte, blocks)
 	for bi := range repl {
 		copy(repl[bi][:], rk)
 	}
-	p, err := blockpack.Encrypt(ctx.Sw.CiP, ctx.EcdCI, ctx.EncCI, repl, level)
+	p, err := blockpack.EncryptAt(ctx.Sw.CiP, ctx.EcdCI, ctx.EncCI, repl, level, ctx.Canon)
 	if err != nil {
 		t.Fatalf("encrypt round key at level %d: %v", level, err)
 	}

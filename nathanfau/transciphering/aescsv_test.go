@@ -29,7 +29,7 @@ import (
 //	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -seed 42 -csv runs/aes.csv
 //	go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -seed 42 -cleanextract -csv runs/aes.csv
 
-var csvFlag = flag.String("csv", "", "append to this file: parameters, timing, and the precision pooled over all 64 ciphertexts. TestAES writes one row per operation, TestAESBench a single row per run; the two carry different columns, so give them different files")
+var csvFlag = flag.String("csv", "", "append to this file: parameters, timing, and the precision pooled over all 64 ciphertexts. TestAES and TestTransciphering write one row per operation (same columns), TestAESBench a single row per run; the two carry different columns, so give them different files")
 
 // csvRunHeader is what every row repeats: the run, and everything that defines what it ran on.
 // csvRowHeader is what each operation adds. Splitting them lets newAESCSV check the widths match
@@ -39,7 +39,7 @@ var csvRunHeader = []string{
 	"run_ts", "host", "gomaxprocs", "go_version", "git_commit",
 	// what was run
 	"logn", "k", "slots", "blocks", "seed", "rounds",
-	"subbytes", "xor", "clean", "cleandepth", "place", "extract", "extractlv",
+	"subbytes", "xor", "clean", "cleandepth", "clean_scale", "refresh_scale", "place", "extract", "extractlv",
 	// the moduli chain
 	"logscale", "primes", "logq0", "logq", "logp", "logqp",
 	"dnum", "digit_bits", "marge", "q_sizes", "p_sizes", "chain_id",
@@ -116,7 +116,7 @@ func csvRunValues(ctx *Context, cfg Config, logN, k, blocks, rounds int, seed in
 
 		itoa(logN), itoa(k), itoa(ctx.Sw.CiP.MaxSlots()), itoa(blocks), strconv.FormatInt(seed, 10), itoa(rounds),
 
-		itoa(*sbVersion), cfg.Xor.String(), cfg.Clean.String(), itoa(cfg.Clean.Depth()),
+		sboxName(), cfg.Xor.String(), cfg.Clean.String(), itoa(cfg.Clean.Depth()), cleanScaleName(ctx), refreshScaleName(ctx),
 		cfg.Place.String(), extractName(cfg), itoa(cfg.ExtractLevels(k)),
 
 		itoa(p.LogDefaultScale()), itoa(len(Q)), itoa(sizeOf(Q[0])),
@@ -236,6 +236,24 @@ func csvIsFresh(path string, header []string) (bool, error) {
 			path, len(head), strings.Join(head[:min(3, len(head))], ","), len(header), strings.Join(header[:3], ","))
 	}
 	return false, nil
+}
+
+// cleanScaleName says where the round cleaning lands: "input" (its input's scale, the historical
+// behaviour) or "fixed" (the default scale, -cleanfixed or -sbexact).
+func cleanScaleName(ctx *Context) string {
+	if ctx.CleanFixedScale || ctx.SBoxExact {
+		return "fixed"
+	}
+	return "input"
+}
+
+// refreshScaleName says how the refresh hands its bits back on Canon: "relabel" (the label is
+// overwritten, the historical behaviour) or "exact" (the extraction lands there, -refreshcanon).
+func refreshScaleName(ctx *Context) string {
+	if ctx.RefreshCanon {
+		return "exact"
+	}
+	return "relabel"
 }
 
 func itoa(v int) string { return strconv.Itoa(v) }

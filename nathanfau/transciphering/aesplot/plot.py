@@ -12,9 +12,9 @@ graphique :
                    en pointillés)
   - une couleur  : un run
 
-    go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -seed 42 -csv runs/aes.csv
-    go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -seed 42 -cleanextract -csv runs/aes.csv
-    python3 nathanfau/transciphering/aesplot/plot.py --csv runs/aes.csv
+    go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -seed 42 -csv runs/2026-09-07_aes.csv
+    go test ./nathanfau/transciphering/ -run '^TestAES$' -v -timeout 0 -seed 42 -cleanextract -csv runs/2026-09-07_aes.csv
+    python3 nathanfau/transciphering/aesplot/plot.py --csv runs/2026-09-07_aes.csv
 """
 
 import argparse
@@ -43,10 +43,12 @@ FLOOR = -5.0
 # Ce qui définit une CONFIGURATION. `seed` en est exclue : sans -seed elle est tirée de l'horloge,
 # donc elle diffère à chaque run sans que rien de la configuration n'ait changé. Le label de légende
 # est construit sur les colonnes qui DIFFÈRENT entre les configurations retenues.
+# `logscale` (la taille des q_i, flag -logqi) et `s2c_levels` (la forme de -stc) passent AVANT
+# `primes` et `chain_id` : quand ils changent, c'est eux que l'etiquette courte doit nommer.
 # `chain_id` identifie les primes elles-memes : deux chaines de memes TAILLES mais dont une prime
 # a change plus bas ne portent pas les memes primes, et ca vaut des bits de precision.
 CONFIG = ["logn", "k", "blocks", "rounds", "subbytes", "xor", "clean",
-          "cleandepth", "place", "extract", "extractlv", "primes", "chain_id"]
+          "cleandepth", "clean_scale", "refresh_scale", "place", "extract", "extractlv", "logscale", "s2c_levels", "primes", "chain_id"]
 
 
 def pick_runs(df, keep_all):
@@ -68,6 +70,12 @@ def run_labels(df):
     """Deux libellés par run : le long pour la légende, le court pour le bout de courbe."""
     per_run = df.groupby("run_ts", sort=True)[CONFIG].first()
     varying = [c for c in CONFIG if c in per_run and per_run[c].nunique() > 1]
+    # Le nom du fichier ne se lit que s'il separe des runs que les colonnes de configuration ne
+    # separent pas deja : sinon il allonge la legende sans rien apprendre.
+    if "source" in varying:
+        rest = [c for c in varying if c != "source"]
+        if rest and len(per_run[rest].drop_duplicates()) == len(per_run[varying].drop_duplicates()):
+            varying = rest
     # L'etiquette courte prend le plus petit prefixe de `varying` qui suffise a distinguer les
     # runs : avec un seul axe qui change elle vaut "clean", avec deux elle vaut "11/clean".
     def tag(row, cols):
@@ -141,6 +149,11 @@ def draw(df, args, where):
                  "une 9e couleur ne serait plus distinguable")
 
     full, short = run_labels(df)
+    if args.label:
+        # La legende vient d'une colonne choisie : utile quand les runs different sur trop de
+        # colonnes de configuration pour qu'une liste reste lisible.
+        per_run = df.groupby("run_ts")[args.label].first().astype(str)
+        full, short = per_run.to_dict(), per_run.to_dict()
     fig, ax = plt.subplots(figsize=(11, 5.8), facecolor=SURFACE)
     ax.set_facecolor(SURFACE)
 
@@ -254,7 +267,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--csv", action="append", default=None, metavar="FICHIER",
                     help="repetable : plusieurs CSV sont reunis, et une colonne `source` (le nom "
-                         "du fichier) distingue leurs runs. Defaut runs/aes.csv")
+                         "du fichier) distingue leurs runs. Defaut runs/2026-09-07_aes.csv")
     ap.add_argument("--out", default=None,
                     help="PNG de sortie (defaut : le nom du CSV, plus les filtres). Incompatible avec --split")
     ap.add_argument("--dpi", type=int, default=160)
@@ -270,6 +283,9 @@ def main():
     ap.add_argument("--title", default=None, help="titre du graphique")
     ap.add_argument("--avg", action="store_true",
                     help="tracer aussi prec_avg, en pointilles (par defaut seul le pire slot)")
+    ap.add_argument("--label", default=None, metavar="COL",
+                    help="legende et etiquettes de bout de courbe tirees de la colonne COL, au lieu "
+                         "de la liste des colonnes de configuration qui different")
     ap.add_argument("--all", action="store_true",
                     help="tracer TOUS les runs, y compris plusieurs passes d'une meme configuration")
     args = ap.parse_args()
@@ -277,7 +293,7 @@ def main():
     if args.split not in ("", "none") and args.out:
         sys.exit("--split ecrit plusieurs PNG, il ne peut pas partager un seul --out")
 
-    args.csv = args.csv or ["runs/aes.csv"]
+    args.csv = args.csv or ["runs/2026-09-07_aes.csv"]
     args.stem = args.csv[0].rsplit(".", 1)[0]
 
     # Plusieurs fichiers se reunissent sur l'union de leurs colonnes : les jeux de colonnes ont
@@ -299,6 +315,17 @@ def main():
     # du tout fait echouer le groupby de pick_runs ; presente dans un fichier et pas dans l'autre,
     # elle vaut NaN, et un groupby laisse alors tomber ces lignes sans un mot. Dans les deux cas
     # elle vaut "?", ce qui ne separe rien et ne casse rien.
+    # Exception : un run sans `clean_scale` date d'avant le flag -cleanfixed, donc d'un Cleaning
+    # qui gardait l'echelle de son entree -- c'est un fait, pas une inconnue.
+    if "clean_scale" in df.columns:
+        df["clean_scale"] = df.clean_scale.fillna("input")
+    else:
+        df["clean_scale"] = "input"
+    # Idem pour `refresh_scale` : avant -refreshcanon, le refresh reetiquetait toujours.
+    if "refresh_scale" in df.columns:
+        df["refresh_scale"] = df.refresh_scale.fillna("relabel")
+    else:
+        df["refresh_scale"] = "relabel"
     for c in CONFIG:
         df[c] = df[c].fillna("?") if c in df.columns else "?"
 

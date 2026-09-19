@@ -15,6 +15,7 @@ package transciphering
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
@@ -42,15 +43,37 @@ type Context struct {
 	EncCI *rlwe.Encryptor
 	DecCI *rlwe.Decryptor
 
-	K      int        // bits packed per ciphertext (t = 2^K)
-	Target int        // Algo1 input level (S2C LevelQ)
-	Canon  rlwe.Scale // canonical output scale after refresh
+	K      int // bits packed per ciphertext (t = 2^K)
+	Target int // Algo1 input level (S2C LevelQ)
+
+	// Canon is the scale of the state in the AES circuit: where Refresh leaves it, and where the
+	// state and the round keys are encrypted. It is the zone's scale when there is one, the default
+	// scale otherwise.
+	Canon rlwe.Scale
+	// Zone is the scale of the zone (params2.Shape.LogZone), zero when the chain has none. With a
+	// zone, Refresh hops out of it onto algo1.EntryScale and Algo1 lands back on it.
+	Zone rlwe.Scale
 
 	Cfg Config // the variants this context runs on
 
 	// Quiet silences the progress lines the pipeline prints, so a timed run measures the circuit
 	// alone. The zero value keeps them.
 	Quiet bool
+
+	// SBoxExact runs SubBytes on the exactly aligned S-box (aes.SubByteExact). Temporary, to run a
+	// full AES on it. It also lands the round cleaning on one fixed scale (see cleanFunc): the exact
+	// S-box needs its 8 input bits on the same scale, which MixColumns does not leave them on.
+	SBoxExact bool
+
+	// CleanFixedScale lands the round cleaning on Canon rather than on its input's scale (see
+	// cleanFunc). SBoxExact implies it.
+	CleanFixedScale bool
+
+	// RefreshCanon lands the refresh's bit extraction on Canon itself, so the bits come back on the
+	// canonical scale exactly. Without it the extraction keeps the scale Algo1 hands it -- which
+	// its squarings have pushed a few 2^-16 away from Canon -- and the refresh then RELABELS the
+	// bits as Canon, which multiplies every 1 by that ratio.
+	RefreshCanon bool
 
 	// Levels that move with the cleaning depth, i.e. with the length of the chain, and with the
 	// SlotsToCoeffs block: every prime it spends beyond the first lifts the pipeline by a level.
@@ -96,6 +119,14 @@ func (c Config) Extract() func(ckks.Parameters, *ckks.Evaluator, *rlwe.Ciphertex
 	return bitbatching.BitExtract
 }
 
+// ExtractTo is Extract with the bits landed on a chosen scale.
+func (c Config) ExtractTo() func(ckks.Parameters, *ckks.Evaluator, *rlwe.Ciphertext, int, rlwe.Scale) ([]*rlwe.Ciphertext, error) {
+	if c.CleanExtract {
+		return bitbatching.BitExtractCleanTo
+	}
+	return bitbatching.BitExtractTo
+}
+
 // ExtractLevels is how many primes that extraction spends, which the chain has to carry above the
 // refresh.
 func (c Config) ExtractLevels(k int) int {
@@ -138,7 +169,8 @@ func NewContextWith(logN, k int, cfg Config) (*Context, error) {
 
 // NewContextWith2 is NewContextWith on a chosen parameter shape (see params2.Shape). P leaves Q
 // untouched and moves only the key-switching, where the SlotsToCoeffs block and q0 reshape the
-// chain itself, so the context's own levels follow them.
+// chain itself, so the context's own levels follow them. A zone keeps the levels and moves the
+// scale instead: see Context.Zone.
 func NewContextWith2(logN, k int, cfg Config, sh params2.Shape) (*Context, error) {
 	depth := cfg.Clean.Depth()
 	params, btpParams, err := params2.TranscipheringParamsWith(logN, k, depth, cfg.ExtractLevels(k), sh)
@@ -207,6 +239,13 @@ func NewContextWith2(logN, k int, cfg Config, sh params2.Shape) (*Context, error
 	// CleanOne is the only placement that sends the key straight to the XOR, i.e. below h(state).
 	c.ARKKeyLv = c.ARKLv - cfg.Place.YDrop(depth)
 	c.LastKeyLv = c.RefreshLv - cfg.Place.YDrop(depth)
+
+	// With a zone the state lives at its scale, so Canon follows it. Without one nothing hops, and
+	// the pipeline runs exactly as it did before zones existed.
+	if sh.HasZone() {
+		c.Zone = sh.ZoneScale()
+		c.Canon = c.Zone
+	}
 
 	// Debug decoding contexts: Std (residual) and CI (AES circuit).
 	debug.EncStd, debug.DecStd, debug.ParamsStd = ckks.NewEncoder(params), rlwe.NewDecryptor(params, sk), params
@@ -316,10 +355,14 @@ func (c *Context) FirstRound(blocks [][16]byte, rk0 blockpack.Packed) (blockpack
 
 // SubBytes applies the selected SubByte version to the whole state, i.e. to all 64 ciphertexts.
 func (c *Context) SubBytes(st blockpack.Packed, version int) (blockpack.Packed, error) {
+	sbox := c.AE.SubByte
+	if c.SBoxExact {
+		sbox = c.AE.SubByteExact
+	}
 	var out blockpack.Packed
 	for g := 0; g < 8; g++ {
 		t0 := time.Now()
-		ob, err := c.AE.SubByte(st[g], version)
+		ob, err := sbox(st[g], version)
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("SubBytes group %d (v%d): %w", g, version, err)
 		}
@@ -329,10 +372,20 @@ func (c *Context) SubBytes(st blockpack.Packed, version int) (blockpack.Packed, 
 	return out, nil
 }
 
-// Refresh refreshes the whole state and applies ShiftRows at the Algo1 pause
+// zoneScaleTol is how close, in bits, Refresh's output must land on the zone's scale before it is
+// labelled with it: off by more, the label would change the value.
+const zoneScaleTol = 30
+
+// inZone reports whether the context runs a zone (see Context.Zone).
+func (c *Context) inZone() bool { return c.Zone.Value.Sign() != 0 }
+
+// Refresh refreshes the whole state and applies ShiftRows at the Algo1 pause. With a zone, the
+// conversion to Std is also the hop out of it, onto the scale Algo1 wants, and Algo1 lands back on
+// the zone's scale (algo1.ExtractTo).
 func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 	eval := c.Eval
 	ck := eval.Evaluator
+	entry := algo1.EntryScale(eval)
 
 	// 1-2. BitPack the 4-bit nibbles in CI, then convert to Std
 	t0 := time.Now()
@@ -347,7 +400,11 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			return blockpack.Packed{}, fmt.Errorf("refresh BitPack high g=%d: %w", g, err)
 		}
 		for i, ciNib := range [2]*rlwe.Ciphertext{lo, hi} {
-			s, err := c.Sw.CIToStandard(ciNib)
+			out := ciNib.Scale // no zone: the conversion keeps the scale
+			if c.inZone() {
+				out = entry
+			}
+			s, err := c.Sw.CIToStandardTo(ciNib, out)
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("refresh CIToStandard g=%d nibble %d: %w", g, i, err)
 			}
@@ -363,7 +420,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 		if d := packed[p].Level() - c.Target; d > 0 {
 			ck.DropLevel(packed[p], d)
 		}
-		rr, ii, err := algo1.Extract(eval, c.Sw, packed[p], c.K)
+		rr, ii, err := algo1.ExtractTo(eval, c.Sw, packed[p], c.K, c.Zone)
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh Extract packet %d: %w", p, err)
 		}
@@ -386,7 +443,17 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 
 	// 6. Per output group, the bit extraction of its 4 nibbles (its two bytes), then CombineReIm (real
 	//    byte + i*imag byte), Std -> CI and the canonical scale on its 8 bits.
-	extract := c.Cfg.Extract()
+	// The extraction lands on Canon under RefreshCanon, on its input's scale otherwise. The Re/Im
+	// recombination (a multiplication by i) and StandardToCI both keep the scale, so what reaches
+	// the relabel below is exactly what the extraction produced.
+	extractTo := c.Cfg.ExtractTo()
+	extract := func(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext, k int) ([]*rlwe.Ciphertext, error) {
+		if c.RefreshCanon {
+			return extractTo(params, eval, ct, k, c.Canon)
+		}
+		return extractTo(params, eval, ct, k, ct.Scale)
+	}
+	relabelGap := math.Inf(1) // the largest scale gap the relabel below overwrites, as -log2
 	var out blockpack.Packed
 	for j := 0; j < 8; j++ {
 		tExt := time.Now()
@@ -419,11 +486,25 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("refresh StandardToCI j=%d beta=%d: %w", j, beta, err)
 			}
+			gap := ci.Scale.Log2Delta(c.Canon)
+			if c.RefreshCanon && gap < 40 {
+				return blockpack.Packed{}, fmt.Errorf("refresh j=%d beta=%d: extraction landed 2^-%.1f off Canon", j, beta, gap)
+			}
+			if c.inZone() && gap < zoneScaleTol {
+				return blockpack.Packed{}, fmt.Errorf("refresh j=%d beta=%d: scale 2^%.6f is 2^-%.1f off the zone's 2^%.6f, want below 2^-%d",
+					j, beta, ci.Scale.Log2(), gap, c.Canon.Log2(), zoneScaleTol)
+			}
+			relabelGap = math.Min(relabelGap, gap)
 			ci.Scale = c.Canon
 			out[j][beta] = ci
 		}
 		c.logf("[Algo1] group %d/8: bit extraction, 4 nibbles (%s) + Re/Im recombination and Std->CI, 8 bits (%s)\n",
 			j+1, dExt.Round(time.Millisecond), time.Since(tConv).Round(time.Millisecond))
+	}
+	if math.IsInf(relabelGap, 1) {
+		c.logf("[Algo1] bits on Canon exactly, nothing relabelled\n")
+	} else {
+		c.logf("[Algo1] relabel to Canon: true scale off by up to 2^-%.1f (a relative error of that size on every 1)\n", relabelGap)
 	}
 	return out, nil
 }
@@ -450,7 +531,7 @@ func (c *Context) AddRoundKey(st, rk blockpack.Packed) (blockpack.Packed, error)
 // Clean pulls every bit of the state back onto 0 and 1 after the round has spread them, with the
 // polynomial Cfg.Clean names (SmootherCleaning by default, see discussion in []).
 func (c *Context) Clean(st blockpack.Packed) (blockpack.Packed, error) {
-	clean := c.Cfg.Clean.Func()
+	clean := c.cleanFunc()
 	var out blockpack.Packed
 	for g := 0; g < 8; g++ {
 		for b := 0; b < 8; b++ {
@@ -464,6 +545,19 @@ func (c *Context) Clean(st blockpack.Packed) (blockpack.Packed, error) {
 	return out, nil
 }
 
+// cleanFunc is the round cleaning. The MixColumns trees have 5 or 7 leaves depending on the bit, so
+// the 8 bits of a byte reach the cleaning on scales a few 2^-17 apart, and a cleaning that keeps
+// its input's scale hands them on to the next SubBytes. The exact S-box refuses that, so under
+// SBoxExact (or CleanFixedScale) the cleaning lands every bit on Canon instead -- the default scale,
+// or the zone's -- no level, the polynomial
+// evaluator picks its constants for the target.
+func (c *Context) cleanFunc() cleaning.CleanFunc {
+	if c.CleanFixedScale || c.SBoxExact {
+		return c.Cfg.Clean.FuncAt(c.Canon)
+	}
+	return c.Cfg.Clean.Func()
+}
+
 // XorClean is AddRoundKey and Clean in one step, for the same depth: it cleans the state and the
 // round key (CleanBoth) or the state only (CleanOne) BEFORE XORing them, instead of XORing first
 // and cleaning the result. Cleaning before the XOR keeps the polynomial inside its basin and does
@@ -474,7 +568,7 @@ func (c *Context) XorClean(st, rk blockpack.Packed) (blockpack.Packed, error) {
 		return blockpack.Packed{}, fmt.Errorf("XorClean (%s): round key at level %d, state at level %d, want key at %d",
 			c.Cfg.Place, kl, sl, sl-drop)
 	}
-	route, xor, clean := c.Cfg.Place.Func(), c.AE.Of(c.Cfg.Xor), c.Cfg.Clean.Func()
+	route, xor, clean := c.Cfg.Place.Func(), c.AE.Of(c.Cfg.Xor), c.cleanFunc()
 
 	var out blockpack.Packed
 	for g := 0; g < 8; g++ {

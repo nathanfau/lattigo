@@ -57,8 +57,8 @@ func TestAESBench(t *testing.T) {
 	rk := aes.KeyExpansion(key[:])
 	last := len(rk) - 1 // round 0 is the initial ARK, the last one has no MixColumns
 
-	fmt.Printf(" AES-128 bench: SubBytes=V%d, XOR=%s, clean=%s, place=%s, extract=%s, %s, random seed = %d \n",
-		*sbVersion, cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), chainName(sh), seed)
+	fmt.Printf(" AES-128 bench: SubBytes=V%s, XOR=%s, clean=%s, place=%s, extract=%s, %s, random seed = %d \n",
+		sboxName(), cfg.Xor, cfg.Clean, cfg.Place, extractName(cfg), chainName(sh), seed)
 
 	// The parameters are built once more here, outside the chronos, to print the chain before the
 	// long part: a chain that cannot be built fails now rather than inside the KeyGen.
@@ -79,6 +79,9 @@ func TestAESBench(t *testing.T) {
 		t.Fatalf("NewContext: %v", err)
 	}
 	ctx.Quiet = true
+	ctx.SBoxExact = *sbExactFlag
+	ctx.CleanFixedScale = *cleanFixed
+	ctx.RefreshCanon = *refreshCanon
 	ciP := ctx.Sw.CiP
 	nBlocks := blockpack.Capacity(ciP)
 	rkHE := make([]blockpack.Packed, len(rk))
