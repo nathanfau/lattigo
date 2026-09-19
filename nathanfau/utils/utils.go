@@ -12,6 +12,7 @@ import (
 type OpCounter struct {
 	Relin   int
 	Rescale int
+	Align   int // rescales the exact S-box spends bringing a ciphertext down on an exact scale
 }
 
 var Ops OpCounter

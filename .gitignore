@@ -69,3 +69,11 @@ nathanfau/blockenc/blt/blt_test.go
 
 # outils de tracé et leurs sorties : du Python et des PNG, pas du code de la bibliothèque
 nathanfau/cleaning/cleanplot/
+
+# autre projet local (étude des fuites), hors du dépôt
+nathanfau2/
+nathanfau/psweep/
+nathanfau/graphique/
+
+# runs du pipeline (CSV, figures, logs) : gérés hors du dépôt
+nathanfau/transciphering/runs/
