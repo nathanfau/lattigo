@@ -161,7 +161,19 @@ order:
 go test ./nathanfau/<package>/ -v
 ```
 
-`debug`, `params2` and `utils` have no test of their own; they are exercised through the packages that use them. Two packages take flags.
+`debug`, `params2` and `utils` have no test of their own; they are exercised through the packages that use them. Three packages take flags.
+
+### algo1
+
+`TestAlgo1Zone` is `TestAlgo1` on the transciphering chain with a zone: the primes from
+Conv_{Real->Cplx} up to the bit extraction, and the scale they run at, take `-zone` bits (default
+33; 38 is the chain without a zone). The scale is checked at each edge of the zone. `-pre` and
+`-post` add that many XOR layers before the refresh and after the bit extraction (default 0), so
+the scale drifts the way the AES circuit makes it drift.
+
+```bash
+go test ./nathanfau/algo1/ -run '^TestAlgo1Zone$' -v -zone 33 -pre 3 -post 4 -timeout 0
+```
 
 ### blockpack
 
@@ -177,7 +189,7 @@ go test ./nathanfau/blockpack/ -v
 
 `-rounds` is how many AES middle rounds `TestTransciphering` chains (default 1), `-subbytes` picks the SubBytes variant, 1 to 3 by decreasing cost (247, 98 and 69 relinearisations per byte). The default is 2, the middle one.
 
-Four more flags select the variants the pipeline runs on, so a whole matrix of circuits can be
+Five more flags select the variants the pipeline runs on, so a whole matrix of circuits can be
 compared without touching the code:
 
 | flag | values | default |
@@ -186,6 +198,7 @@ compared without touching the code:
 | `-clean` | `cleaning` (2 levels), `smoother` or `verysmoother` (3 levels, one prime more) | `cleaning` |
 | `-place` | `after` (AddRoundKey then Cleaning), `both` (clean both operands, then XOR), `one` (clean the state only, then XOR) | `after` |
 | `-seed` | seed of the block draw, 0 draws one from the clock | `0` |
+| `-zone` | size of the primes of the AES circuit and the bit extraction, and of their scale; `0` or the `-logqi` value is no zone | `0` |
 
 `-xor` is the one that decides whether the cipher completes. It applies to **every** gate: the
 initial AddRoundKey, the round AddRoundKey, and the XOR trees of MixColumns. `sq` fails a full
@@ -199,6 +212,11 @@ level a round key has to be encrypted at, which `Context.ARKKeyLv` and `Context.
 
 `-seed` fixes which blocks the batch carries, not the key or the encryption noise, which lattigo
 draws from `crypto/rand`: two runs on one seed are far closer than on two, not identical.
+
+`-zone`, like `-clean`, is baked into the parameters. With a zone, the state and the round keys
+are encrypted at its scale, the refresh leaves it for the bootstrap and Algo1 lands back on it;
+without one the pipeline runs exactly as before. A run in a zone shows in the CSV through
+`q_sizes` and `chain_id`.
 
 ```bash
 go test ./nathanfau/transciphering/ -run '^TestTransciphering$' -v -subbytes 3 -rounds 1 -timeout 0

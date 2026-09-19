@@ -131,6 +131,12 @@ func WantSlots(params ckks.Parameters, blocks [][16]byte) [][]float64 {
 
 // Encrypt packs up to Capacity(params) blocks into a Packed state at the given level.
 func Encrypt(params ckks.Parameters, ecd *ckks.Encoder, enc *rlwe.Encryptor, blocks [][16]byte, level int) (Packed, error) {
+	return EncryptAt(params, ecd, enc, blocks, level, params.DefaultScale())
+}
+
+// EncryptAt is Encrypt at the given scale rather than the default one: the scale of the zone the
+// state lives in, when the pipeline runs one (params2.Shape.LogZone).
+func EncryptAt(params ckks.Parameters, ecd *ckks.Encoder, enc *rlwe.Encryptor, blocks [][16]byte, level int, scale rlwe.Scale) (Packed, error) {
 	var p Packed
 	slots := params.MaxSlots()
 	half := slots / 2
@@ -142,6 +148,7 @@ func Encrypt(params ckks.Parameters, ecd *ckks.Encoder, enc *rlwe.Encryptor, blo
 		for b := 0; b < 8; b++ {
 			vals := SlotVec(params, blocks, g, b)
 			pt := ckks.NewPlaintext(params, level)
+			pt.Scale = scale
 			if err := ecd.Encode(vals, pt); err != nil {
 				return p, fmt.Errorf("blockpack.Encrypt encode [g=%d][b=%d]: %w", g, b, err)
 			}
