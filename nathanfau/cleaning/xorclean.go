@@ -42,6 +42,22 @@ func (k Kind) Func() CleanFunc {
 	}
 }
 
+// FuncAt is Func with the output landed on the fixed scale W instead of the input's own. Bits
+// that reach the cleaning on slightly different scales -- the MixColumns trees have 5 or 7 leaves
+// depending on the bit -- all leave it on W, at no extra level.
+func (k Kind) FuncAt(W rlwe.Scale) CleanFunc {
+	coeffs := basicCoeffs
+	switch k {
+	case Smoother:
+		coeffs = smootherCoeffs
+	case VerySmoother:
+		coeffs = verySmootherCoeffs
+	}
+	return func(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+		return evalAt(params, eval, ct, coeffs, W, "Cleaning")
+	}
+}
+
 func (k Kind) String() string {
 	switch k {
 	case Smoother:
