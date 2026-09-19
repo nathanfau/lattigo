@@ -29,13 +29,15 @@ type polyCtx struct {
 	lvIn   int
 }
 
-func newPolyCtx(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext) *polyCtx {
+// newPolyCtx evaluates on ct and lands every result on W. W is usually ct.Scale; any scale close to
+// it works, the polynomial evaluator picking its constants for the target.
+func newPolyCtx(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext, W rlwe.Scale) *polyCtx {
 	return &polyCtx{
 		eval:   eval,
 		params: params,
 		pe:     ckkspoly.NewEvaluator(params, eval),
 		pb:     commonpoly.NewPowerBasis(ct, bignum.Monomial),
-		W:      ct.Scale,
+		W:      W,
 		lvIn:   ct.Level(),
 	}
 }

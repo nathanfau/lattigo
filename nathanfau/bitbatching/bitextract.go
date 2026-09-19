@@ -35,12 +35,18 @@ import (
 // The LSB is a special case: X^{t/2} is (-1)^m, already real on the roots, so it needs neither a
 // half spectrum nor a conjugation.
 func BitExtract(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext, k int) ([]*rlwe.Ciphertext, error) {
+	return BitExtractTo(params, eval, ct, k, ct.Scale)
+}
+
+// BitExtractTo is BitExtract with the bits landed on the scale W instead of the input's. W must be
+// close to ct.Scale; the landing is exact and costs no level.
+func BitExtractTo(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext, k int, W rlwe.Scale) ([]*rlwe.Ciphertext, error) {
 	if k < 1 {
 		return nil, fmt.Errorf("BitExtract: k must be >= 1")
 	}
 
 	t := 1 << k
-	c := newPolyCtx(params, eval, ct)
+	c := newPolyCtx(params, eval, ct, W)
 
 	results := make([]*rlwe.Ciphertext, k)
 	for l := 0; l < k; l++ {
@@ -86,7 +92,7 @@ func BitExtractInterp(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Cip
 		return nil, fmt.Errorf("BitExtractInterp: k must be >= 1")
 	}
 
-	c := newPolyCtx(params, eval, ct)
+	c := newPolyCtx(params, eval, ct, ct.Scale)
 
 	results := make([]*rlwe.Ciphertext, k)
 	for l := 0; l < k; l++ {
@@ -112,11 +118,17 @@ func BitExtractInterp(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Cip
 // side is a level shallower but pays it back on the product with u, and one more on the rescaling
 // settle closes -- that last one is the only one that could still be argued with.
 func BitExtractClean(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext, k int) ([]*rlwe.Ciphertext, error) {
+	return BitExtractCleanTo(params, eval, ct, k, ct.Scale)
+}
+
+// BitExtractCleanTo is BitExtractClean with the bits landed on the scale W instead of the input's,
+// as BitExtractTo.
+func BitExtractCleanTo(params ckks.Parameters, eval *ckks.Evaluator, ct *rlwe.Ciphertext, k int, W rlwe.Scale) ([]*rlwe.Ciphertext, error) {
 	if k < 1 {
 		return nil, fmt.Errorf("BitExtractClean: k must be >= 1")
 	}
 
-	c := newPolyCtx(params, eval, ct)
+	c := newPolyCtx(params, eval, ct, W)
 
 	u, err := rootNorm(eval, ct, c.W)
 	if err != nil {
