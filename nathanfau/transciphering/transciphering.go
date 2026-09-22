@@ -400,11 +400,15 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			return blockpack.Packed{}, fmt.Errorf("refresh BitPack high g=%d: %w", g, err)
 		}
 		for i, ciNib := range [2]*rlwe.Ciphertext{lo, hi} {
-			out := ciNib.Scale // no zone: the conversion keeps the scale
-			if c.inZone() {
-				out = entry
-			}
-			s, err := c.Sw.CIToStandardTo(ciNib, out)
+			// Algo1 veut son entree a EntryScale, zone ou pas. ScaleDown ne corrige l'ecart qu'a un
+			// facteur ENTIER pres ; ce qui reste atteint le mod-1 comme une erreur RELATIVE sur le
+			// message, qu'Algo1, contrairement a EvalMod, ne sait pas rediviser ensuite. Cette
+			// conversion est gratuite (elle multiplie par une constante), donc la sauter ne faisait
+			// economiser rien et coutait 6,6 bits sur la sortie d'Algo1 : mesure a logN 16, sans
+			// zone, l'erreur d'Algo1 valait 2^-5,9 contre 2^-12,5 avec une zone, ce qui tuait
+			// l'extraction `half` (lineaire en cette erreur) des le tour 3 et laissait passer
+			// `clean` (quadratique) a exactement le double de bits.
+			s, err := c.Sw.CIToStandardTo(ciNib, entry)
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("refresh CIToStandard g=%d nibble %d: %w", g, i, err)
 			}
