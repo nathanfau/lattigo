@@ -168,7 +168,7 @@ func TestTransciphering(t *testing.T) {
 	memTable("before the rounds", ctx, packedItem("round keys", rkHE...), packedItem("state", st))
 
 	fmt.Println("================ input (entry to round 1) ================")
-	rec.add(0, "input", 0, report(ctx, st, states, 0, "input"))
+	rec.add(0, "input", 0, report(ctx, st, states, 0, "input"), RefreshTimings{})
 
 	times := map[string][]time.Duration{}
 	tGlobal := time.Now()
@@ -195,7 +195,12 @@ func TestTransciphering(t *testing.T) {
 					aes.AddRoundKey(states[bi][:], rk[r])
 				}
 			}
-			rec.add(r, name, dur, report(ctx, st, states, r, name))
+			// Le detail par etape n'a de sens que pour le Refresh : ailleurs, sept cellules vides.
+			var tm RefreshTimings
+			if name == "Refresh" {
+				tm = ctx.LastRefresh
+			}
+			rec.add(r, name, dur, report(ctx, st, states, r, name), tm)
 		}
 
 		if st, err = ctx.Round(st, rkHE[r], *sbVersion, after); err != nil {
@@ -307,7 +312,7 @@ func TestAES(t *testing.T) {
 	if l := st[0][0].Level(); l != ctx.SubBytesLv {
 		t.Errorf("FirstRound left the state at level %d, want the SubBytes level %d", l, ctx.SubBytesLv)
 	}
-	rec.add(0, "FirstRound", dFirst, report(ctx, st, states, 0, "FirstRound"))
+	rec.add(0, "FirstRound", dFirst, report(ctx, st, states, 0, "FirstRound"), RefreshTimings{})
 	memLine("after T0")
 
 	// round and rkNow name the round in flight, so the same hook serves the middle rounds and the
@@ -329,7 +334,12 @@ func TestAES(t *testing.T) {
 				aes.AddRoundKey(states[bi][:], rkNow)
 			}
 		}
-		rec.add(round, name, dur, report(ctx, st, states, round, name))
+		// Le detail par etape n'a de sens que pour le Refresh : ailleurs, sept cellules vides.
+		var tm RefreshTimings
+		if name == "Refresh" {
+			tm = ctx.LastRefresh
+		}
+		rec.add(round, name, dur, report(ctx, st, states, round, name), tm)
 	}
 
 	for r := 1; r <= nMiddle; r++ {

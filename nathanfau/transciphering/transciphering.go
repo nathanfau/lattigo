@@ -50,6 +50,10 @@ type Context struct {
 	// state and the round keys are encrypted. It is the zone's scale when there is one, the default
 	// scale otherwise.
 	Canon rlwe.Scale
+	// LastRefresh is where the last Refresh spent its time, stage by stage. The CSV writes it on the
+	// Refresh row; nothing else reads it.
+	LastRefresh RefreshTimings
+
 	// Zone is the scale of the zone (params2.Shape.LogZone), zero when the chain has none. With a
 	// zone, Refresh hops out of it onto algo1.EntryScale and Algo1 lands back on it.
 	Zone rlwe.Scale
@@ -372,6 +376,21 @@ func (c *Context) SubBytes(st blockpack.Packed, version int) (blockpack.Packed, 
 	return out, nil
 }
 
+// RefreshTimings is where the last Refresh spent its time. It embeds algo1's own breakdown and adds
+// what the refresh does around it -- ShiftRows, the bit extraction, and the conversions that are
+// not Algorithm 1's. Reset at the top of every Refresh, so it always describes the LAST one.
+//
+// The buckets are meant to ACCOUNT FOR the whole refresh: Other absorbs BitPack, ScaleDown, ModUp
+// and the recombinations, so STC + CTS + EvalMod + Extract + Conv + SR + Other comes back to the
+// refresh's own duration, give or take the scheduler. A breakdown that does not add up hides
+// exactly what one wants to see.
+type RefreshTimings struct {
+	algo1.Timings
+	BitPack   time.Duration // packing the 4-bit nibbles in CI, before the conversion out
+	SR        time.Duration // ShiftRows at the Algo1 pause
+	Recombine time.Duration // CombineReIm on the 64 extracted bits, after the pause
+}
+
 // zoneScaleTol is how close, in bits, Refresh's output must land on the zone's scale before it is
 // labelled with it: off by more, the label would change the value.
 const zoneScaleTol = 30
@@ -386,11 +405,14 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 	eval := c.Eval
 	ck := eval.Evaluator
 	entry := algo1.EntryScale(eval)
+	c.LastRefresh = RefreshTimings{} // ce chrono decrit LE refresh en cours, pas la somme du run
+	tm := &c.LastRefresh
 
 	// 1-2. BitPack the 4-bit nibbles in CI, then convert to Std
 	t0 := time.Now()
 	var packed [16]*rlwe.Ciphertext
 	for g := 0; g < 8; g++ {
+		tPack := time.Now()
 		lo, err := bitbatching.BitPack(c.Sw.EvalCI, st[g][0:4])
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh BitPack low g=%d: %w", g, err)
@@ -399,6 +421,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh BitPack high g=%d: %w", g, err)
 		}
+		tm.BitPack += time.Since(tPack)
 		for i, ciNib := range [2]*rlwe.Ciphertext{lo, hi} {
 			// Algo1 veut son entree a EntryScale, zone ou pas. ScaleDown ne corrige l'ecart qu'a un
 			// facteur ENTIER pres ; ce qui reste atteint le mod-1 comme une erreur RELATIVE sur le
@@ -408,7 +431,9 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			// zone, l'erreur d'Algo1 valait 2^-5,9 contre 2^-12,5 avec une zone, ce qui tuait
 			// l'extraction `half` (lineaire en cette erreur) des le tour 3 et laissait passer
 			// `clean` (quadratique) a exactement le double de bits.
+			tConv := time.Now()
 			s, err := c.Sw.CIToStandardTo(ciNib, entry)
+			tm.Conv += time.Since(tConv)
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("refresh CIToStandard g=%d nibble %d: %w", g, i, err)
 			}
@@ -424,7 +449,7 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 		if d := packed[p].Level() - c.Target; d > 0 {
 			ck.DropLevel(packed[p], d)
 		}
-		rr, ii, err := algo1.ExtractTo(eval, c.Sw, packed[p], c.K, c.Zone)
+		rr, ii, err := algo1.ExtractToTimed(eval, c.Sw, packed[p], c.K, c.Zone, &tm.Timings)
 		if err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh Extract packet %d: %w", p, err)
 		}
@@ -433,13 +458,15 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 	}
 
 	// 4. ShiftRows at the pause: pure pointer moves on the 32 packed nibbles.
+	tSR := time.Now()
 	re, im := c.AE.ShiftRows(reals, imags)
+	tm.SR += time.Since(tSR)
 
 	// 5. algo1.Resume: the double-angle squarings, on all 32 nibbles (square is pointwise, commutes
 	//    with the ShiftRows permutation).
 	t0 = time.Now()
 	for k := 0; k < 16; k++ {
-		if err := algo1.Resume(eval, re[k], im[k]); err != nil {
+		if err := algo1.ResumeTimed(eval, re[k], im[k], &tm.Timings); err != nil {
 			return blockpack.Packed{}, fmt.Errorf("refresh Resume %d: %w", k, err)
 		}
 	}
@@ -478,15 +505,20 @@ func (c *Context) Refresh(st blockpack.Packed) (blockpack.Packed, error) {
 			return blockpack.Packed{}, fmt.Errorf("refresh extract im high j=%d: %w", j, err)
 		}
 		dExt := time.Since(tExt)
+		tm.Extract += dExt
 		aBits := append(append([]*rlwe.Ciphertext{}, aLo...), aHi...) // 8 bits of the real byte
 		bBits := append(append([]*rlwe.Ciphertext{}, bLo...), bHi...) // 8 bits of the imag byte
 		tConv := time.Now()
 		for beta := 0; beta < 8; beta++ {
+			tRe := time.Now()
 			z, err := utils.CombineReIm(ck, aBits[beta], bBits[beta])
+			tm.Recombine += time.Since(tRe)
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("refresh CombineReIm j=%d beta=%d: %w", j, beta, err)
 			}
+			tStd := time.Now()
 			ci, err := c.Sw.StandardToCI(z)
+			tm.Conv += time.Since(tStd)
 			if err != nil {
 				return blockpack.Packed{}, fmt.Errorf("refresh StandardToCI j=%d beta=%d: %w", j, beta, err)
 			}

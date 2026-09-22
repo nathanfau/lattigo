@@ -56,6 +56,12 @@ var csvRowHeader = []string{
 	"seq", "round", "step",
 	// what it cost
 	"ms", "elapsed_ms",
+	// Where the REFRESH spent its ms, stage by stage and in pipeline order; empty on every other
+	// step. Every stage that is timed has its own column; `ms_reste` is what none of them claimed --
+	// `ms` minus their sum, so the twelve ALWAYS reconcile and an unmeasured cost shows up there
+	// instead of hiding inside a bucket.
+	"ms_bitpack", "ms_conv", "ms_stc", "ms_scaledown", "ms_modup", "ms_cts", "ms_combine",
+	"ms_evalmod", "ms_extract", "ms_sr", "ms_recombine", "ms_reste",
 	// what came out
 	"level", "prec_avg", "prec_min", "worst_err", "slots_pooled", "bit_err", "blocks_wrong",
 }
@@ -148,7 +154,10 @@ func csvRunValues(ctx *Context, cfg Config, logN, k, blocks, rounds int, seed in
 // precision is reached -- not the wall clock, which also carries the oracle traces between the
 // operations. That is the x of a precision-against-cost plot: two configurations that spend a
 // different number of operations are only comparable on the time they spend.
-func (c *aesCSV) add(round int, step string, dur time.Duration, prec precSummary) {
+// add records one operation. tm is the stage breakdown of a Refresh; pass the zero value for every
+// other step and the seven columns come out empty rather than zero -- an empty cell reads as "this
+// step has no stages", a zero would read as "it spent no time there".
+func (c *aesCSV) add(round int, step string, dur time.Duration, prec precSummary, tm RefreshTimings) {
 	if c == nil {
 		return
 	}
@@ -158,11 +167,35 @@ func (c *aesCSV) add(round int, step string, dur time.Duration, prec precSummary
 	row = append(row,
 		itoa(c.seq), itoa(round), step,
 		ftoa(float64(dur.Microseconds())/1000, 3),
-		ftoa(float64(c.elapsed.Microseconds())/1000, 3),
+		ftoa(float64(c.elapsed.Microseconds())/1000, 3))
+	row = append(row, stageCols(tm, dur)...)
+	row = append(row,
 		itoa(prec.Level), ftoa(prec.AvgPrec, 3), ftoa(negLog2(prec.WorstBit), 3), ftoa(prec.WorstBit, 6),
 		itoa(prec.Slots), ftoa(prec.BitErr, 6), itoa(prec.Wrong))
 	c.rows = append(c.rows, row)
 }
+
+// stageCols renders the stage columns, or as many empty cells when nothing was measured. The last
+// one is the remainder: dur minus everything the stages claimed, so the columns always add back up
+// to `ms`. A stage nobody times lands there and is visible, instead of inflating a neighbour.
+func stageCols(tm RefreshTimings, dur time.Duration) []string {
+	if tm == (RefreshTimings{}) {
+		return make([]string, 12)
+	}
+	stages := []time.Duration{
+		tm.BitPack, tm.Conv, tm.STC, tm.ScaleDown, tm.ModUp, tm.CTS, tm.Combine,
+		tm.EvalMod, tm.Extract, tm.SR, tm.Recombine,
+	}
+	out := make([]string, 0, len(stages)+1)
+	rest := dur
+	for _, d := range stages {
+		out = append(out, millisOf(d))
+		rest -= d
+	}
+	return append(out, millisOf(rest))
+}
+
+func millisOf(d time.Duration) string { return ftoa(float64(d.Microseconds())/1000, 3) }
 
 // write APPENDS to the file, so successive runs accumulate: point every run at the same -csv and
 // the comparison is a group-by on run_ts, or on whichever parameter column changed. The header goes

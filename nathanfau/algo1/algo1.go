@@ -11,6 +11,7 @@ package algo1
 import (
 	"fmt"
 	"math/big"
+	"time"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/bootstrapping"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
@@ -34,12 +35,14 @@ const (
 // step1 performs step 1 of Algorithm 1, that is CTS after ModRaise after STC(ct),
 // and recombines the real and imaginary halves into one complex ciphertext. It also returns what
 // ScaleDown could not correct (1 when ct arrives at EntryScale).
-func step1(eval *bootstrapping.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext, rlwe.Scale, error) {
+func step1(eval *bootstrapping.Evaluator, ct *rlwe.Ciphertext, tm *Timings) (*rlwe.Ciphertext, rlwe.Scale, error) {
 
 	//debug.DbgSlotStd("step1 in:", ct)
 	//debug.DbgChain("step1 in:", eval.Evaluator, ct)
 
+	t0 := time.Now()
 	ctSTC, err := eval.SlotsToCoeffs(ct, nil)
+	since(&tm.STC, t0)
 	if err != nil {
 		return nil, rlwe.Scale{}, fmt.Errorf("step1 SlotsToCoeffs: %w", err)
 	}
@@ -47,7 +50,9 @@ func step1(eval *bootstrapping.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext
 	//debug.DbgCoeff("after STC:", ctSTC)
 	//debug.DbgChain("after STC:", eval.Evaluator, ctSTC)
 
+	t0 = time.Now()
 	ctSD, errScale, err := eval.ScaleDown(ctSTC)
+	since(&tm.ScaleDown, t0)
 	if err != nil {
 		return nil, rlwe.Scale{}, fmt.Errorf("step1 ScaleDown: %w", err)
 	}
@@ -55,14 +60,18 @@ func step1(eval *bootstrapping.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext
 	//debug.DbgCoeff("after ScaleDown:", ctSD)
 	//debug.DbgChain("after ScaleDown:", eval.Evaluator, ctSD)
 
+	t0 = time.Now()
 	ctMU, err := eval.ModUp(ctSD)
+	since(&tm.ModUp, t0)
 	if err != nil {
 		return nil, rlwe.Scale{}, fmt.Errorf("step1 ModUp: %w", err)
 	}
 
 	//debug.DbgChain("after ModUp:", eval.Evaluator, ctMU)
 
+	t0 = time.Now()
 	ctReal, ctImag, err := eval.CoeffsToSlots(ctMU)
+	since(&tm.CTS, t0)
 	if err != nil {
 		return nil, rlwe.Scale{}, fmt.Errorf("after CoeffsToSlots: %w", err)
 	}
@@ -74,7 +83,9 @@ func step1(eval *bootstrapping.Evaluator, ct *rlwe.Ciphertext) (*rlwe.Ciphertext
 	//debug.DbgSlotStd("after CTS imag:", ctImag)
 	//debug.DbgChain("after CTS:", eval.Evaluator, ctReal)
 
+	t0 = time.Now()
 	ct1, err := utils.CombineReIm(eval.Evaluator, ctReal, ctImag)
+	since(&tm.Combine, t0)
 	if err != nil {
 		return nil, rlwe.Scale{}, fmt.Errorf("step1 CombineReIm: %w", err)
 	}
@@ -146,13 +157,22 @@ func Extract(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.Ci
 //
 // A zero out is Extract: no check, and extractExp keeps the scale it is given.
 func ExtractTo(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.Ciphertext, k int, out rlwe.Scale) (ctreal, ctimag *rlwe.Ciphertext, err error) {
+	return ExtractToTimed(eval, sw, ct, k, out, nil)
+}
+
+// ExtractToTimed is ExtractTo accumulating the duration of each stage into tm. A nil tm times
+// nothing. See Timings.
+func ExtractToTimed(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.Ciphertext, k int, out rlwe.Scale, tm *Timings) (ctreal, ctimag *rlwe.Ciphertext, err error) {
+	if tm == nil {
+		tm = &Timings{} // jete : les sites instrumentes n'ont plus a tester
+	}
 	zone := out.Value.Sign() != 0
 
 	// 1. ct1 <- CTS after ModRaise after STC(ct), recombined into one complex ct
 
 	//fmt.Println("---- Algo1 line 1: step1 (STC, ModRaise, CTS) ----")
 
-	ct1, errScale, err := step1(eval, ct)
+	ct1, errScale, err := step1(eval, ct, tm)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 1: %w", err)
 	}
@@ -168,7 +188,9 @@ func ExtractTo(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.
 
 	//fmt.Println("---- Algo1 line 2: StandardToCI ----")
 
+	t0 := time.Now()
 	ct2, err := sw.StandardToCI(ct1)
+	since(&tm.Conv, t0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 2 StandardToCI: %w", err)
 	}
@@ -183,7 +205,9 @@ func ExtractTo(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.
 	t := 1 << k
 	period := 1.0 / float64(t)
 
+	t0 = time.Now()
 	ctcos, err := trigo.EvalCos(sw.CiP, sw.EvalCI, ct2, 1, period, evalExpR, evalCosDeg)
+	since(&tm.EvalMod, t0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 3 EvalCos: %w", err)
 	}
@@ -191,7 +215,9 @@ func ExtractTo(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.
 	//debug.DbgSlotCI("ctcos (CI):", ctcos)
 	//debug.DbgChain("ctcos (CI):", sw.EvalCI, ctcos)
 
+	t0 = time.Now()
 	ctsin, err := trigo.EvalSin(sw.CiP, sw.EvalCI, ct2, 1, period, evalExpR, evalCosDeg)
+	since(&tm.EvalMod, t0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 4 EvalSin: %w", err)
 	}
@@ -203,7 +229,9 @@ func ExtractTo(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.
 
 	//fmt.Println("---- Algo1 lines 5-6: CIToStandard ----")
 
+	t0 = time.Now()
 	ctcosC, err := sw.CIToStandard(ctcos)
+	since(&tm.Conv, t0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 5 CIToStandard cos: %w", err)
 	}
@@ -211,7 +239,9 @@ func ExtractTo(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.
 	//debug.DbgSlotStd("ctcosC (Std):", ctcosC)
 	//debug.DbgChain("ctcosC (Std):", eval.Evaluator, ctcosC)
 
+	t0 = time.Now()
 	ctsinC, err := sw.CIToStandard(ctsin)
+	since(&tm.Conv, t0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("line 6 CIToStandard sin: %w", err)
 	}
@@ -228,7 +258,9 @@ func ExtractTo(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.
 		// extractExp rescales once, so Resume starts one level below its inputs.
 		mid = squareInput(eval.BootstrappingParameters, min(ctcosC.Level(), ctsinC.Level())-1, out)
 	}
+	t0 = time.Now()
 	ctreal, ctimag, err = extractExp(eval.Evaluator, ctcosC, ctsinC, mid)
+	since(&tm.Extract, t0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("lines 7-12 extractExp: %w", err)
 	}
@@ -243,7 +275,19 @@ func ExtractTo(eval *bootstrapping.Evaluator, sw *convctx.CtxSwitcher, ct *rlwe.
 // Resume finishes Algorithm 1 after the pause: the evalExpR double-angle squarings that
 // bring the extracted Re/Im parts from the base frequency to the target t-th roots of unity.
 func Resume(eval *bootstrapping.Evaluator, ctreal, ctimag *rlwe.Ciphertext) error {
-	if err := squareExp(eval.Evaluator, ctreal, ctimag, evalExpR); err != nil {
+	return ResumeTimed(eval, ctreal, ctimag, nil)
+}
+
+// ResumeTimed is Resume accumulating the squarings into tm.EvalMod, the mod-1 evaluation they
+// finish. A nil tm times nothing.
+func ResumeTimed(eval *bootstrapping.Evaluator, ctreal, ctimag *rlwe.Ciphertext, tm *Timings) error {
+	if tm == nil {
+		tm = &Timings{}
+	}
+	t0 := time.Now()
+	err := squareExp(eval.Evaluator, ctreal, ctimag, evalExpR)
+	since(&tm.EvalMod, t0)
+	if err != nil {
 		return fmt.Errorf("squareExp: %w", err)
 	}
 
